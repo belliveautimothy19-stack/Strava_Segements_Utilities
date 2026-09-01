@@ -90,7 +90,8 @@ import gpxpy
 
 from segmatch.match import (MatchConfig, prepare_target,
                              match_segment, null_scores)
-from segmatch.profile import build_profile, vertical_change
+from segmatch.profile import (build_profile, vertical_change,
+                               detect_quantization)
 
 TOKEN_FILE = Path.home() / ".strava_segment_matcher_tokens.json"
 
@@ -918,6 +919,13 @@ def describe_significance(score, null):
 
 
 def main():
+    # Defaults come FROM MatchConfig rather than being repeated here.
+    # Duplicating them let two of them drift: --grade-res-m stayed at 120
+    # and --weight-gain at 4.0 after the library moved to 70 and 2.0, so
+    # every command line run silently used superseded parameters while the
+    # library, the tests and the benchmark all used the current ones.
+    _D = MatchConfig()
+
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -933,30 +941,33 @@ def main():
                           "(default 15, so a 30x30 km box)")
 
     g = ap.add_argument_group("matching")
-    g.add_argument("--grade-res-m", type=float, default=120.0,
+    g.add_argument("--grade-res-m", type=float, default=_D.res_m,
                     help="Physical resolution (m) at which grade is "
-                         "estimated. Replaces the old --grade-bin-mi. "
-                         "Default 120 m was selected by sweeping 25 m to "
-                         "600 m against a labelled set: F1 peaks on a 90 "
-                         "to 120 m plateau at 0.955, against 0.903 at the "
-                         "old 0.25 mi (402 m) value. See PARAMETERS.md")
-    g.add_argument("--min-window-frac", type=float, default=0.75,
+                         "estimated. To tell two profiles apart at a "
+                         "pitch length p you need this at or below p, so "
+                         "a coarse value silently merges genuinely "
+                         "different terrain: at 120 m a staircase of 60 m "
+                         "pitches scores 0.19 against a uniform climb of "
+                         "the same length, gain and loss. Going finer "
+                         "costs tolerance to elevation noise and "
+                         "rounding. See PARAMETERS.md")
+    g.add_argument("--min-window-frac", type=float, default=_D.min_ratio,
                     help="Shortest matching window, as a fraction of the "
                          "target length (default 0.75)")
-    g.add_argument("--max-window-frac", type=float, default=1.15,
+    g.add_argument("--max-window-frac", type=float, default=_D.max_ratio,
                     help="Longest matching window, as a fraction of the "
                          "target length (default 1.15)")
-    g.add_argument("--length-steps", type=int, default=7,
+    g.add_argument("--length-steps", type=int, default=_D.length_steps,
                     help="How many window lengths to try between the min "
                          "and max fractions (default 7). 1.0x is always "
                          "included regardless. The winner is then refined "
                          "by local search, so this grid only has to be "
                          "good enough to find the right basin")
-    g.add_argument("--start-step-frac", type=float, default=0.02,
+    g.add_argument("--start-step-frac", type=float, default=_D.stride_frac,
                     help="Window offset step, as a fraction of the target "
                          "length (default 0.02). As with --length-steps, "
                          "the winning offset is refined afterwards")
-    g.add_argument("--max-shift-frac", type=float, default=0.03,
+    g.add_argument("--max-shift-frac", type=float, default=_D.max_shift_frac,
                     help="Alignment tolerance: how far a feature may sit "
                          "from where the target has it and still match, "
                          "as a fraction of target length (default 0.03). "
@@ -971,17 +982,17 @@ def main():
                          "a pattern that repeats within one long segment")
 
     w = ap.add_argument_group("scoring weights")
-    w.add_argument("--weight-shape", type=float, default=1.0,
+    w.add_argument("--weight-shape", type=float, default=_D.w_shape,
                     help="Weight on the ordered shape term (default 1.0)")
-    w.add_argument("--weight-distribution", type=float, default=0.6,
+    w.add_argument("--weight-distribution", type=float, default=_D.w_dist,
                     help="Weight on grade composition regardless of order "
                          "(default 0.6, kept below shape so composition "
                          "is not double counted)")
-    w.add_argument("--weight-gain", type=float, default=4.0,
-                    help="Weight on vertical deviation (default 4.0; "
-                         "scales a dimensionless fraction to sit "
-                         "alongside the grade-percent terms)")
-    w.add_argument("--weight-length", type=float, default=2.0,
+    w.add_argument("--weight-gain", type=float, default=_D.w_gain,
+                    help="Weight on vertical deviation. The term is "
+                         "bounded in [0, 1] and symmetric, so this is the "
+                         "full cost of a total vertical mismatch")
+    w.add_argument("--weight-length", type=float, default=_D.w_len,
                     help="Weight on window length deviation (default 2.0)")
 
     a = ap.add_argument_group("access")
@@ -1136,6 +1147,14 @@ def main():
     print(f"  Grade profile: {len(target.seq)} samples at "
           f"{args.grade_res_m:.0f} m resolution")
     print(f"  Grade composition: {format_band_breakdown(target.seq)}")
+    q = detect_quantization(elevs)
+    if q >= 2.0:
+        print(f"  WARNING: target elevation is quantized to {q:.1f} m steps. "
+              f"Rounding that coarse manufactures alternating flat and "
+              f"steep samples at roughly the step spacing, which a "
+              f"{args.grade_res_m:.0f} m representation partly resolves as "
+              f"real terrain. Consider --grade-res-m {max(120.0, 3 * q * 10):.0f} "
+              f"or finer source data.")
     if args.not_reversible:
         print("  (matching as-recorded direction only)")
     print()

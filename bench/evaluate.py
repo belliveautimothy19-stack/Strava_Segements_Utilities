@@ -40,15 +40,21 @@ POS, NEG, HARD = "positive", "negative", "hard"
 
 
 def build_dataset(seed=20240501, n_targets=6, target_lengths=(2400.0,
-                  4000.0, 6200.0, 9000.0)):
-    """Return a list of (target_d, target_e, cases) tuples."""
+                  4000.0, 6200.0, 9000.0), beta=1.45,
+                  resolution_probes=True):
+    """Return a list of (target_d, target_e, cases) tuples.
+
+    beta controls how the synthetic terrain spreads grade energy across
+    scales; see synth._broadband. resolution_probes adds the gain-matched
+    staircase groups described below.
+    """
     rng = np.random.default_rng(seed)
     kinds = list(synth.ARCHETYPES)
     dataset = []
     for t in range(n_targets):
         kind = kinds[t % len(kinds)]
         L = target_lengths[t % len(target_lengths)]
-        td, te = synth.terrain(rng, L, kind, spacing=8.0)
+        td, te = synth.terrain(rng, L, kind, spacing=8.0, beta=beta)
         cases = []
 
         def add(label, d, e, truth=None, tag=""):
@@ -106,6 +112,13 @@ def build_dataset(seed=20240501, n_targets=6, target_lengths=(2400.0,
         d, e, tr = synth.embed(ext_d, ext_e, rng)
         add(POS, d, e, tr, "extended_1.12")
 
+        d, e, tr = synth.embed(td, te, rng)
+        add(POS, d, synth.quantize_elevation(e, 1.0), tr, "dem_quantized")
+
+        d, e, tr = synth.embed(td, te, rng)
+        add(POS, d, synth.smooth_elevation(d, e, 30.0), tr,
+            "provider_smoothed")
+
         d, e, tr = synth.embed(td, te, rng, pre_m=0.0)
         add(POS, d, e, tr, "at_route_start")
 
@@ -117,7 +130,7 @@ def build_dataset(seed=20240501, n_targets=6, target_lengths=(2400.0,
             if k == kind:
                 continue
             nd, ne = synth.terrain(rng, L * rng.uniform(1.1, 2.2), k,
-                                    spacing=10.0)
+                                    spacing=10.0, beta=beta)
             add(NEG, nd, ne, None, f"unrelated_{k}")
 
         sd, se = synth.shuffle_blocks(td, te, rng)
@@ -138,7 +151,53 @@ def build_dataset(seed=20240501, n_targets=6, target_lengths=(2400.0,
         add(HARD, d, e, tr, "section_replaced")
 
         dataset.append((td, te, cases))
+
+    if resolution_probes:
+        dataset.extend(_resolution_probe_groups(rng))
     return dataset
+
+
+def _resolution_probe_groups(rng):
+    """Groups whose negatives differ from the target ONLY below a known
+    physical scale.
+
+    The target is a uniform climb. Each negative is a staircase with
+    exactly the same length, gain and loss, so length, vertical and grade
+    composition are all matched by construction and only ordered shape at
+    scales below the pitch can separate them. A representation coarser
+    than the pitch cannot, and will score these as near-perfect matches.
+
+    These exist because the original benchmark could not have detected
+    under-resolution: its generator produced no structure below about
+    250 m, so every resolution it tried was adequate for the data.
+    """
+    groups = []
+    for length_m, grade in ((4000.0, 0.06), (6000.0, 0.045)):
+        gain = grade * length_m
+        ud, ue = synth.uniform_climb(length_m, grade, spacing=4.0)
+        cases = []
+
+        for tag, mut in (
+                ("uniform_exact", lambda d, e: (d, e)),
+                ("uniform_noisy",
+                 lambda d, e: (d, synth.add_baro_noise(e, rng, 0.6))),
+                ("uniform_coarse_gps",
+                 lambda d, e: synth.resample_at(d, e, 25.0)),
+                ("uniform_quantized",
+                 lambda d, e: (d, synth.quantize_elevation(e, 1.0)))):
+            d, e = mut(ud, ue)
+            d2, e2, tr = synth.embed(d, e, rng, pre_m=900.0, post_m=700.0)
+            cases.append({"label": POS, "d": d2, "e": e2, "truth": tr,
+                          "tag": tag})
+
+        for pitch in (40.0, 60.0, 100.0):
+            sd, se = synth.gain_matched_staircase(length_m, gain, pitch,
+                                                   spacing=4.0)
+            d2, e2, _ = synth.embed(sd, se, rng, pre_m=900.0, post_m=700.0)
+            cases.append({"label": NEG, "d": d2, "e": e2, "truth": None,
+                          "tag": f"staircase_{pitch:.0f}m"})
+        groups.append((ud, ue, cases))
+    return groups
 
 
 def _iou(a, b):

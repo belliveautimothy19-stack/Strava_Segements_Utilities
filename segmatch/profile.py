@@ -26,7 +26,8 @@ Two ideas carry the whole module:
 
 import numpy as np
 
-__all__ = ["Profile", "sanitize", "build_profile", "vertical_change"]
+__all__ = ["Profile", "sanitize", "build_profile", "vertical_change",
+           "detect_quantization"]
 
 
 class Profile:
@@ -227,3 +228,39 @@ def vertical_change(cum_dist, elev, resample_m=25.0):
     # abs() rather than negation: summing an empty selection yields -0.0,
     # which prints as "-0 ft".
     return float(diff[diff > 0].sum()), float(abs(diff[diff < 0].sum()))
+
+
+def detect_quantization(elev, max_step_m=10.0):
+    """Estimate the elevation quantization step, or 0.0 if unquantized.
+
+    Elevation served from a DEM is often rounded, and rounding is not
+    noise: it is a deterministic staircase whose steps can be large
+    compared with the elevation change across one grade sample, so it
+    manufactures alternating flat and steep samples on a uniform climb.
+    The finer the grade resolution, the more of that artifact survives
+    into the representation. Measured on synthetic terrain, the same route
+    quantized to 5 m scored 1.48 against its unquantized self at
+    res_m 120, 2.52 at res_m 70 and 3.82 at res_m 50, where unrelated
+    terrain scored about 3.1. At 50 m resolution, coarse quantization is
+    therefore worse than no match at all.
+
+    Returned so callers can warn and suggest a coarser resolution rather
+    than silently producing bad matches. Works by taking the greatest
+    common divisor of the distinct elevation values, in units of 1 cm.
+    """
+    e = np.asarray(elev, dtype=float)
+    e = e[np.isfinite(e)]
+    if e.size < 8:
+        return 0.0
+    cent = np.round(e * 100.0).astype(np.int64)
+    uniq = np.unique(cent)
+    if uniq.size < 3:
+        return 0.0
+    diffs = np.diff(uniq)
+    diffs = diffs[diffs > 0]
+    if diffs.size == 0:
+        return 0.0
+    step = int(np.gcd.reduce(diffs))
+    step_m = step / 100.0
+    # A step of 1 cm or less is just float noise, not quantization.
+    return step_m if 0.01 < step_m <= max_step_m else 0.0

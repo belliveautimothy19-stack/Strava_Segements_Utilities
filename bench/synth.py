@@ -15,28 +15,68 @@ Every generator is seeded, so the whole evaluation is reproducible.
 import numpy as np
 
 ARCHETYPES = ("smooth_climb", "rolling", "alternating", "flat_with_pinch",
-              "steep_short", "variable", "descent")
+              "steep_short", "variable", "descent", "switchback")
 
 
-def terrain(rng, length_m, kind="variable", spacing=10.0, beta=1.7):
-    """Return (cum_dist, elev) for one synthetic route."""
+def _broadband(rng, n, length_m, beta, min_wavelength_m, grade_sd_pct):
+    """Zero-mean roughness with a power-law spectrum, built by inverse FFT.
+
+    Amplitude falls as k^-beta, the standard first-order model of natural
+    topography, with energy generated down to min_wavelength_m rather than
+    to a fixed harmonic count.
+
+    That distinction is not cosmetic. An earlier version of this generator
+    summed a fixed 24 harmonics over the route length, so its shortest
+    wavelength was length/24: 250 m on a 6 km route. The benchmark
+    therefore contained nothing a 120 m representation could
+    under-resolve, and a resolution sweep run against it could not have
+    detected under-resolution however badly the matcher suffered from it.
+
+    The result is normalized on the standard deviation of its GRADE, not
+    of its elevation. A power law otherwise couples two things that must
+    be controlled separately: beta sets how energy is distributed across
+    scales, while grade_sd_pct sets how rough the route is. Normalizing on
+    elevation makes a rougher spectrum also a steeper route, so a sweep
+    over beta would confound the two.
+    """
+    nf = n // 2 + 1
+    k = np.arange(nf, dtype=float)
+    kmax = max(2.0, length_m / max(min_wavelength_m, 1e-9))
+    amp = np.zeros(nf)
+    band = (k >= 1.0) & (k <= kmax)
+    if not band.any():
+        band = (k >= 1.0) & (k <= 2.0)
+    amp[band] = k[band] ** (-beta)
+    spec = amp * np.exp(1j * rng.uniform(0.0, 2.0 * np.pi, nf))
+    y = np.fft.irfft(spec, n=n)
+    dx = length_m / max(1, n - 1)
+    g_sd = float(np.std(np.gradient(y, dx) * 100.0))
+    return y / g_sd * grade_sd_pct if g_sd > 0 else y
+
+
+def terrain(rng, length_m, kind="variable", spacing=10.0, beta=1.45,
+            min_wavelength_m=25.0, grade_sd_pct=4.0):
+    """Return (cum_dist, elev) for one synthetic route.
+
+    beta sets how grade energy is spread across scales: 1.7 is smooth and
+    long-wavelength dominated, 1.1 is rough with substantial structure
+    below 100 m. Real running terrain spans that range, so the resolution
+    sweep is run across it rather than at one value.
+
+    min_wavelength_m sets the finest structure present. Keep it at or
+    above 2.5*spacing so the profile is not aliased at generation time.
+    """
     n = max(16, int(length_m / spacing) + 1)
     x = np.linspace(0.0, length_m, n)
-
-    # Power-law roughness: natural terrain has more energy at long
-    # wavelengths, falling off as roughly k^-1.7.
-    e = np.zeros(n)
-    for k in range(1, 25):
-        amp = rng.normal(0, 1.0) * (k ** -beta) * 60.0
-        e += amp * np.sin(2 * np.pi * k * x / length_m
-                          + rng.uniform(0, 2 * np.pi))
+    min_wl = max(min_wavelength_m, 2.5 * spacing)
+    e = _broadband(rng, n, length_m, beta, min_wl, grade_sd_pct)
 
     if kind == "smooth_climb":
-        e = 0.4 * e + 0.06 * x
+        e = 0.45 * e + 0.06 * x
     elif kind == "descent":
-        e = 0.4 * e - 0.055 * x
+        e = 0.45 * e - 0.055 * x
     elif kind == "rolling":
-        e = 1.2 * e + 0.005 * x
+        e = 1.25 * e + 0.005 * x
     elif kind == "alternating":
         e = 0.5 * e + 35 * np.sin(2 * np.pi * x / max(400.0, length_m / 6))
     elif kind == "flat_with_pinch":
@@ -45,8 +85,38 @@ def terrain(rng, length_m, kind="variable", spacing=10.0, beta=1.7):
         e = 0.25 * e + pinch + 0.004 * x
     elif kind == "steep_short":
         e = 0.3 * e + 0.11 * x
-    # "variable" keeps the raw power-law shape
+    elif kind == "switchback":
+        # Short alternating pitches on a net climb, the shape a benchmark
+        # made only of long wavelengths never produces.
+        e = 0.5 * e + 0.05 * x + 6.0 * np.sin(2 * np.pi * x / 70.0)
+    # "variable" keeps the raw broadband shape
     return x, e + 1500.0
+
+
+def staircase(length_m, pitch_m, pitch_grade, spacing=2.0, base=1500.0):
+    """Alternating steep pitch and flat recovery.
+
+    Built so that a staircase and a uniform climb can be given identical
+    length, gain and loss: over each pitch_m + flat_m cycle both rise by
+    the same amount. Only their ordered shape differs, and only at scales
+    below the cycle length, which makes this the sharpest available probe
+    of whether the representation is resolved finely enough.
+    """
+    n = max(16, int(length_m / spacing) + 1)
+    x = np.linspace(0.0, length_m, n)
+    cycle = 2.0 * pitch_m
+    rise = pitch_m * pitch_grade
+    c = np.floor(x / cycle)
+    off = x - cycle * c
+    e = c * rise + np.where(off < pitch_m, pitch_grade * off, rise)
+    return x, e + base
+
+
+def uniform_climb(length_m, grade, spacing=2.0, base=1500.0):
+    """Steady grade, for pairing with staircase()."""
+    n = max(16, int(length_m / spacing) + 1)
+    x = np.linspace(0.0, length_m, n)
+    return x, base + grade * x
 
 
 def add_baro_noise(elev, rng, sigma=0.6):
@@ -152,3 +222,48 @@ def shuffle_blocks(cum_dist, elev, rng, n_blocks=6):
     nd = np.concatenate([[0.0], np.cumsum(L)])
     ne = np.concatenate([[e[0]], e[0] + np.cumsum(g * L)])
     return nd, ne
+
+
+def quantize_elevation(elev, step_m=1.0):
+    """Round elevation to a fixed step.
+
+    Strava serves elevation derived from a DEM, and several sources round
+    to whole metres. Quantization is not noise: it is a deterministic
+    staircase whose steps are large compared with the elevation change
+    across one grade sample, so it can manufacture alternating flat and
+    steep samples on a perfectly uniform climb.
+    """
+    return np.round(np.asarray(elev, dtype=float) / step_m) * step_m
+
+
+def smooth_elevation(cum_dist, elev, window_m=30.0):
+    """Moving-average smoothing of the kind a provider applies before
+    serving an elevation stream. Applied to one copy of a positive so the
+    benchmark contains pairs that differ by provider processing alone."""
+    d = np.asarray(cum_dist, dtype=float)
+    e = np.asarray(elev, dtype=float)
+    if d.size < 3:
+        return e
+    dx = float(np.median(np.diff(d)))
+    w = max(1, int(round(window_m / max(dx, 1e-9))))
+    if w < 2:
+        return e
+    k = np.ones(w) / w
+    pad = w // 2
+    padded = np.concatenate([np.full(pad, e[0]), e, np.full(pad, e[-1])])
+    out = np.convolve(padded, k, mode="valid")
+    return out[:e.size] if out.size >= e.size else np.resize(out, e.size)
+
+
+def gain_matched_staircase(length_m, total_gain_m, pitch_m, spacing=2.0,
+                            base=1500.0):
+    """A staircase with exactly `total_gain_m` of ascent over `length_m`.
+
+    Pairs with uniform_climb(length_m, total_gain_m / length_m) to give
+    two routes of identical length, identical gain and identical loss
+    whose ONLY difference is ordered shape below the cycle length. If the
+    representation is too coarse to resolve `pitch_m`, the matcher cannot
+    tell them apart, and no other scoring term can rescue it.
+    """
+    grade = 2.0 * total_gain_m / max(length_m, 1e-9)
+    return staircase(length_m, pitch_m, grade, spacing=spacing, base=base)

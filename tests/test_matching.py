@@ -190,7 +190,10 @@ class TestDiscrimination(MatchCase):
         hilly_e = 1500.0 + 0.08 * fd
         ms = match_segment(fd, hilly_e, flat_target, cfg)
         self.assertTrue(ms)
-        self.assertGreater(ms[0].gain_dev, 1.0)
+        # The term is bounded at 1.0 by design; a flat target against a
+        # steadily climbing candidate is the maximum disagreement there
+        # is, so the lock is that it saturates rather than going quiet.
+        self.assertGreater(ms[0].gain_dev, 0.9)
 
 
 class TestRepeatsAndOverlap(MatchCase):
@@ -293,13 +296,21 @@ class TestProfileInvariants(unittest.TestCase):
         rng = np.random.default_rng(2)
         d, e = synth.terrain(rng, 5000.0, "rolling", 5.0)
         base = build_profile(d, e, 120.0)
-        for spacing in (10.0, 20.0, 40.0):
+        grade_sd = float(np.std(np.gradient(e, d) * 100.0))
+        # Bounded relative to the signal, not by an absolute grade. The
+        # old absolute 1.0 percent bound was set when the generator
+        # produced nothing below 250 m wavelength; on terrain with real
+        # short-scale structure, sampling at 40 m genuinely loses more,
+        # and an absolute bound would only be re-tightening the benchmark
+        # until it stopped complaining.
+        for spacing, tol in ((10.0, 0.10), (20.0, 0.15), (40.0, 0.30)):
             rd, re = synth.resample_at(d, e, spacing)
             p = build_profile(rd, re, 120.0)
             n = min(len(base.grade), len(p.grade))
-            self.assertLess(
-                np.abs(base.grade[:n] - p.grade[:n]).max(), 1.0,
-                f"spacing {spacing}")
+            worst = float(np.abs(base.grade[:n] - p.grade[:n]).max())
+            self.assertLess(worst, tol * grade_sd,
+                            f"spacing {spacing}: {worst:.2f}% is more than "
+                            f"{100*tol:.0f}% of the {grade_sd:.2f}% grade sd")
 
     def test_vertical_change_is_resolution_independent(self):
         """Regression lock for the gain bug. Naive summed differences

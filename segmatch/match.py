@@ -84,12 +84,23 @@ final score
 
 EXACTNESS
 =========
-The search returns the true best `pool_size` windows under this scoring
-function. Windows are skipped only when their Keogh lower bound already
-exceeds the worst score currently in the pool, which by admissibility of
-the bound means their exact score would have too. Pruning changes runtime,
-never the result. test_matching.py asserts this by running with pruning
-disabled and comparing.
+Stated precisely, because the loose version of this claim is wrong.
+
+The GRID search is exact: over the finite set of (length, offset,
+direction) triples the grid generates, it returns the true best
+`pool_size`. Windows are skipped only when their Keogh lower bound
+already exceeds the worst score in the pool, which by admissibility of
+the bound means their exact score would have too. Pruning therefore
+changes runtime and never the result, and test_matching.py asserts that
+by running with pruning disabled and comparing.
+
+The RETURNED window is not a global optimum over the continuous space of
+(start, length). The grid winners are refined by local coordinate descent
+(see _refine), which is a local improvement, not a global search. A
+better window could in principle exist in a basin the grid never sampled.
+Making stride_frac and length_steps finer shrinks that gap at linear
+cost; the defaults were chosen so the grid reliably lands in the right
+basin on the benchmark, which is an empirical claim rather than a proof.
 
 Complexity: O(W * n_cmp) for screening plus O(P * n_cmp * band) for the
 P windows that survive it, where W is the number of windows and P is
@@ -104,13 +115,45 @@ from .distance import (dtw_band, keogh_envelope, lb_keogh, wasserstein1,
                         grade_histogram, hist_distance)
 
 __all__ = ["MatchConfig", "Match", "TargetSpec", "prepare_target",
-           "match_segment", "null_scores", "comparison_length"]
+           "match_segment", "null_scores", "comparison_length",
+           "vertical_deviation"]
 
-# Minimum vertical (metres) used as the gain-term denominator, so a flat
-# target cannot drive it to a division by zero or make it inert. A target
-# with under this much total vertical is flat for training purposes, and
-# windows are then judged on how little vertical they have.
+# Floor (metres) on the vertical term's denominator, so two profiles that
+# are both essentially flat cannot divide zero by zero.
 MIN_VERT_DENOM_M = 10.0
+
+# The Keogh bound is dropped for a segment if it fails to prune at least
+# LB_MIN_HIT_RATE of the first LB_PROBE_WINDOWS windows it is offered.
+# Correctness is unaffected: not pruning is always safe.
+LB_PROBE_WINDOWS = 120
+LB_MIN_HIT_RATE = 0.08
+
+
+def vertical_deviation(gain, loss, target_gain, target_loss,
+                       floor=MIN_VERT_DENOM_M):
+    """Bounded, symmetric disagreement in ascent and descent. Range [0, 1].
+
+    Dividing by the TARGET's vertical alone, as this previously did, has
+    two defects. It is unbounded: a target with 20 m of gain against a
+    candidate with 200 m produced a term of 26, which at w_gain 4.0
+    swamped a shape distance whose whole range is about 0 to 10, so
+    ranking among candidates reflected vertical and nothing else. And it
+    is asymmetric: scoring A against B gave 16.0 where B against A gave
+    24.3, purely because the denominator changed.
+
+    Both matter beyond tidiness. An unbounded term whose scale depends on
+    the target's vertical makes scores incomparable BETWEEN targets, which
+    is exactly what the null-model percentile and any fixed reporting
+    threshold rely on.
+
+    Normalizing by the sum of both profiles' vertical fixes both: the
+    result is symmetric in (candidate, target) and lies in [0, 1], while
+    keeping the same ordering for a fixed target.
+    """
+    denom = gain + loss + target_gain + target_loss
+    if denom < floor:
+        return 0.0
+    return (abs(gain - target_gain) + abs(loss - target_loss)) / denom
 
 
 class MatchConfig:
@@ -137,6 +180,14 @@ class MatchConfig:
                        so the existing values were kept.
       w_len 2.0        smallest weight that makes the reported window
                        land on the true extent rather than a clipped one.
+      length_steps 5   deliberately coarse, with stride_frac 0.06. The
+      stride_frac 0.06 grid exists only to find the right basin; the
+                       winner is then refined off-grid. Swept from
+                       (0.02, 7) to (0.08, 5): AUC 0.978 to 0.982, F1
+                       0.936 to 0.938 and localization 1.000 at every
+                       setting, while runtime fell from 279 ms to 145 ms.
+                       Paying for a fine grid buys nothing that
+                       refinement does not already supply.
     """
 
     __slots__ = ("res_m", "oversample", "min_ratio", "max_ratio",
@@ -145,9 +196,9 @@ class MatchConfig:
                  "max_overlap", "pool_size", "top_k", "use_pruning",
                  "dist_bin_w")
 
-    def __init__(self, res_m=120.0, oversample=4, min_ratio=0.75,
-                 max_ratio=1.15, length_steps=7, stride_frac=0.02,
-                 max_shift_frac=0.03, w_shape=1.0, w_dist=0.6, w_gain=4.0,
+    def __init__(self, res_m=70.0, oversample=8, min_ratio=0.75,
+                 max_ratio=1.15, length_steps=5, stride_frac=0.06,
+                 max_shift_frac=0.03, w_shape=1.0, w_dist=0.6, w_gain=2.0,
                  w_len=2.0, vert_resample_m=25.0, max_overlap=0.5,
                  pool_size=16, top_k=1, use_pruning=True,
                  dist_bin_w=0.0):
@@ -306,8 +357,8 @@ def _score_window(prof, target, cfg, start, win_len, direction, unit):
     else:
         seq, g_dir, l_dir = -grades[::-1], loss, gain
     len_dev = abs(win_len - target.length_m) / target.length_m
-    gain_dev = ((abs(g_dir - target.gain_m) + abs(l_dir - target.loss_m))
-                / target.vert_denom)
+    gain_dev = vertical_deviation(g_dir, l_dir, target.gain_m,
+                                  target.loss_m)
     shape = dtw_band(target.seq, seq, target.band)
     if cfg.dist_bin_w > 0:
         dist = hist_distance(target.hist,
@@ -400,6 +451,9 @@ def match_segment(seg_dist, seg_elev, target, cfg=None, profile=None):
     worst = float("inf")
     n_eval = 0
     n_pruned = 0
+    lb_active = cfg.use_pruning
+    lb_tried = 0
+    lb_hits = 0
 
     for win_len in _window_lengths(target.length_m, total_len, cfg):
         ratio = win_len / target.length_m
@@ -418,23 +472,53 @@ def match_segment(seg_dist, seg_elev, target, cfg=None, profile=None):
                     seq = -grades[::-1]
                     g_dir, l_dir = loss, gain
 
-                # Direction-aware gain term. Comparing signed gain and
-                # loss separately, rather than max(gain, loss), means a
-                # rolling window with 300 m up and 300 m down no longer
-                # scores identically to a pure 300 m climb, and the term
-                # now discriminates direction instead of being invariant
-                # to it by construction.
-                gain_dev = ((abs(g_dir - target.gain_m)
-                             + abs(l_dir - target.loss_m))
-                            / target.vert_denom)
+                # Direction-aware vertical term. Comparing gain and loss
+                # separately, rather than max(gain, loss), means a rolling
+                # window with 300 m up and 300 m down no longer scores
+                # identically to a pure 300 m climb, and the term
+                # discriminates direction instead of being invariant to it
+                # by construction.
+                gain_dev = vertical_deviation(g_dir, l_dir, target.gain_m,
+                                              target.loss_m)
 
                 fixed = (cfg.w_gain * gain_dev + cfg.w_len * len_dev)
 
                 if cfg.use_pruning and len(pool) >= pool_size:
-                    lb = lb_keogh(seq, target.env_up, target.env_dn, n_cmp)
-                    if cfg.w_shape * lb + fixed >= worst:
+                    # Free test first. shape and dist are both
+                    # non-negative, so score >= fixed; if `fixed` alone
+                    # already clears the pool's worst, no distance need be
+                    # computed at all.
+                    if fixed >= worst:
                         n_pruned += 1
                         continue
+                    # The Keogh bound costs about an eighth of a full DTW,
+                    # so it only pays if it fires reasonably often. Whether
+                    # it does depends entirely on the data: windows on one
+                    # segment overlap heavily and therefore score very
+                    # similarly, which puts the pool's worst close to its
+                    # best, and a bound that captures a median 46 percent
+                    # of the true distance cannot clear so tight a
+                    # threshold. Measured on rolling terrain it fired on
+                    # 0.0 percent of windows and made the search 5 percent
+                    # SLOWER than no pruning at all.
+                    #
+                    # So the hit rate is measured rather than assumed. If
+                    # the bound is not earning its keep over the first
+                    # probe windows, it is dropped for the rest of this
+                    # segment. This is a pure runtime decision: skipping
+                    # the bound only ever means not pruning, so the result
+                    # is identical either way.
+                    if lb_active:
+                        lb = lb_keogh(seq, target.env_up, target.env_dn,
+                                      n_cmp)
+                        lb_tried += 1
+                        if cfg.w_shape * lb + fixed >= worst:
+                            lb_hits += 1
+                            n_pruned += 1
+                            continue
+                        if (lb_tried >= LB_PROBE_WINDOWS
+                                and lb_hits < LB_MIN_HIT_RATE * lb_tried):
+                            lb_active = False
 
                 shape = dtw_band(tgt_seq, seq, band)
                 if cfg.dist_bin_w > 0:
@@ -462,22 +546,38 @@ def match_segment(seg_dist, seg_elev, target, cfg=None, profile=None):
     # Deterministic ordering: score, then start, then direction.
     ranked = sorted(pool, key=lambda it: (-it[0], it[1], it[3]))
 
-    accepted = []
-    for it in ranked:
-        span = (it[1], it[2])
-        if any(_overlap_frac(span, (a.start_m, a.end_m)) > cfg.max_overlap
-               for a in accepted):
-            continue
+    # Refine first, then suppress overlap on the refined windows.
+    #
+    # Doing it the other way round breaks the guarantee this function
+    # documents: suppression compared grid windows, refinement then moved
+    # them by up to a stride, and nothing re-checked. Measured over 40
+    # random segments with top_k=4, 3 of 47 accepted pairs came back
+    # overlapping by more than max_overlap, one of them by 59 percent.
+    # Two "distinct" matches that are 59 percent the same ground is
+    # exactly what --matches-per-segment exists to avoid.
+    #
+    # Only a bounded prefix is refined: enough that suppression still has
+    # candidates to fall back on after rejecting overlaps, without paying
+    # to refine the whole pool.
+    budget = min(len(ranked), max(8, 6 * cfg.top_k))
+    refined = []
+    for it in ranked[:budget]:
         res, rs, rl = _refine(prof, target, cfg, it[1], it[2] - it[1],
                               it[3], unit, total_len)
         (score, shape, dist, gain_dev, len_dev, g_dir, l_dir, seq) = res
-        accepted.append(Match(score, shape, dist, gain_dev, len_dev, rs,
-                              rs + rl, it[3], rl / target.length_m,
-                              g_dir, l_dir, seq))
+        refined.append(Match(score, shape, dist, gain_dev, len_dev, rs,
+                             rs + rl, it[3], rl / target.length_m,
+                             g_dir, l_dir, seq))
+    refined.sort(key=lambda m: (m.score, m.start_m, m.direction))
+
+    accepted = []
+    for m in refined:
+        if any(_overlap_frac((m.start_m, m.end_m), (a.start_m, a.end_m))
+               > cfg.max_overlap for a in accepted):
+            continue
+        accepted.append(m)
         if len(accepted) >= cfg.top_k:
             break
-    # Refinement can reorder the accepted windows, so sort once more.
-    accepted.sort(key=lambda m: (m.score, m.start_m))
     return accepted
 
 
