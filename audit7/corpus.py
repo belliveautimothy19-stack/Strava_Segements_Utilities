@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-from audit7.independent import (grade_percent, min_distance_to_set,
+from audit7.independent import (SAME_GROUND_M, grade_percent, min_distance_to_set,
                                 overlap_fraction, resample_uniform,
                                 vertical_change_m, GEO_APART_FRAC,
                                 GEO_SAME_FRAC, MIN_APART_M)
@@ -462,3 +462,48 @@ def assert_no_population_leakage(pairs):
             "pair %s in both %s and %s" % (k, keys.get(k), p["cat"]))
         keys[k] = p["cat"]
     return len(keys)
+
+
+_TRAIL_ID_CACHE = {}
+
+
+def trail_ids(streams=None, overlap_same=GEO_SAME_FRAC, step=4):
+    """Map each route id to a GEOGRAPHIC trail id.
+
+    Two recordings of one trail get the same id. This is the unit of
+    replication, and it must be derived from geography, never from file
+    identity. Labelling by route PAIRING instead reported three trails at
+    6 km when all three pairings were the same physical trail seen twice:
+    19476565994 x 19670306718, and each route against itself. That is
+    pseudo-replication regained through the pair label, which is the
+    precise failure a cluster bootstrap exists to prevent.
+    """
+    if streams is None:
+        streams = load_streams()
+    key = tuple(sorted(streams))
+    if key in _TRAIL_ID_CACHE:
+        return _TRAIL_ID_CACHE[key]
+    ids, reps = {}, []
+    for rid in sorted(streams):
+        ll = np.asarray(streams[rid]["ll"], float)[::step]
+        placed = False
+        for tid, rep in reps:
+            d = min_distance_to_set(ll, rep)
+            if float(np.mean(d <= SAME_GROUND_M)) >= overlap_same:
+                ids[rid] = tid
+                placed = True
+                break
+        if not placed:
+            tid = "trail%d" % len(reps)
+            reps.append((tid, ll))
+            ids[rid] = tid
+    _TRAIL_ID_CACHE[key] = ids
+    return ids
+
+
+def pair_trail_id(pair, ids):
+    """The trail a positive pair belongs to. A positive is same-ground by
+    construction, so both windows share a trail."""
+    a = ids.get(pair["A"]["route"], pair["A"]["route"])
+    b = ids.get(pair["B"]["route"], pair["B"]["route"])
+    return a if a == b else "|".join(sorted((a, b)))

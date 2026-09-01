@@ -12,6 +12,8 @@ implementation details is how six audits in a row produced clean runs
 while the conclusions were wrong.
 """
 
+import math
+
 import numpy as np
 import pytest
 
@@ -414,3 +416,77 @@ def test_comparison_length_cap_is_documented_boundary():
     below = comparison_length(limit - 1000.0, cfg.res_m)
     assert below < 512
     assert (limit - 1000.0) / below == pytest.approx(cfg.res_m / 2.0, rel=0.02)
+
+
+# ------------------------------------------------- unit of replication
+
+def test_cluster_bootstrap_is_wider_than_pair_bootstrap():
+    """Pairs cut from one trail are nested observations, not independent
+    draws. Measured on real data, the pair bootstrap is 1.5x too narrow at
+    1 km and 1.8x at 2.2 km."""
+    from audit7.independent import bootstrap_ci, cluster_bootstrap_ci
+    rng = np.random.default_rng(0)
+    pos, trail = [], []
+    for t in range(4):
+        centre = rng.normal(0.0, 0.8)
+        pos.extend(rng.normal(centre, 0.3, 50).tolist())
+        trail.extend([t] * 50)
+    neg = rng.normal(3.0, 1.0, 400).tolist()
+    plo, phi = bootstrap_ci(pos, neg)
+    clo, chi = cluster_bootstrap_ci(pos, neg, trail)
+    assert (chi - clo) > (phi - plo)
+
+
+def test_single_trail_cannot_produce_a_between_trail_interval():
+    """The 6 km headline came with an interval computed over pairs from
+    one trail. There is no such interval. The function must refuse rather
+    than return a number that looks like one."""
+    from audit7.independent import cluster_bootstrap_ci
+    rng = np.random.default_rng(1)
+    pos = rng.normal(0.0, 1.0, 80).tolist()
+    neg = rng.normal(3.0, 1.0, 200).tolist()
+    lo, hi = cluster_bootstrap_ci(pos, neg, ["one_trail"] * 80)
+    assert math.isnan(lo) and math.isnan(hi)
+
+
+def test_cluster_bootstrap_accepts_tuple_trail_labels():
+    """Trail ids are naturally tuples of route ids; numpy turns a list of
+    tuples into a 2-D array rather than an array of labels."""
+    from audit7.independent import cluster_bootstrap_ci
+    rng = np.random.default_rng(2)
+    pos = rng.normal(0, 1, 40).tolist()
+    neg = rng.normal(3, 1, 60).tolist()
+    labels = [("a", "b")] * 20 + [("c", "d")] * 20
+    lo, hi = cluster_bootstrap_ci(pos, neg, labels)
+    assert not math.isnan(lo) and hi >= lo
+
+
+def test_trail_id_is_geographic_not_file_identity():
+    """Two recordings of one trail must share a trail id.
+
+    Labelling the replication unit by route PAIRING reported three trails
+    at 6 km when all three pairings were the same physical trail seen
+    twice: A x B, A x A and B x B. Pseudo-replication regained through the
+    pair label is precisely what the cluster bootstrap exists to prevent,
+    so the label must come from geography.
+    """
+    ids = C.trail_ids()
+    assert ids["19476565994"] == ids["19670306718"], (
+        "two recordings of one trail must share a trail id")
+    assert len(set(ids.values())) == 5
+    for a, b in (("19131631580", "19621145681"),
+                 ("19853326285", "19869723537"),
+                 ("19476565994", "19853326285")):
+        assert ids[a] != ids[b], (a, b)
+
+
+def test_pair_trail_id_collapses_self_and_cross_pairings():
+    """A x A, B x B and A x B are one trail when A and B are recordings of
+    the same ground, not three."""
+    ids = C.trail_ids()
+    mk = lambda x, y: {"A": {"route": x}, "B": {"route": y}}
+    got = {C.pair_trail_id(mk(a, b), ids)
+           for a, b in (("19476565994", "19476565994"),
+                        ("19670306718", "19670306718"),
+                        ("19476565994", "19670306718"))}
+    assert len(got) == 1, got

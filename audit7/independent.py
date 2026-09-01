@@ -228,3 +228,47 @@ def interval_is_adequate(lo, hi, effect, n_pos=None,
     if n_pos is not None and n_pos < min_pos:
         return False
     return True
+
+
+def cluster_bootstrap_ci(pos, neg, pos_trail, n_boot=2000, seed=0, alpha=0.05):
+    """AUC interval resampling TRAILS, not pairs.
+
+    Pairs cut from one trail are nested observations, not independent
+    ones: 59 category A pairs from a single 24 km trail are repeated
+    looks at the same terrain. Resampling pairs treats them as 59
+    independent draws and returns an interval that is too narrow. Every
+    interval in audits 4 to 7 has that flaw.
+
+    `pos_trail` gives the trail identifier for each positive. Trails are
+    drawn with replacement and all of a drawn trail's pairs come with it,
+    so between-trail variance enters the interval where it belongs.
+
+    Negatives are resampled at the pair level: they are drawn from across
+    the whole corpus and are not clustered in the same way. That is a
+    simplification and is stated rather than hidden; it makes the
+    interval slightly narrower than a fully clustered one would be.
+    """
+    if len(pos) < 2 or len(neg) < 2:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    pos = np.asarray(pos, float)
+    neg = np.asarray(neg, float)
+    # Coerce to opaque string labels. Trail identifiers are naturally
+    # tuples of route ids, and numpy turns a list of tuples into a 2-D
+    # array rather than an array of labels.
+    trails = np.asarray([str(t) for t in pos_trail], dtype=object)
+    uniq = np.unique(trails)
+    if len(uniq) < 2:
+        # One trail cannot support a between-trail interval. Say so rather
+        # than returning a number that looks like one.
+        return float("nan"), float("nan")
+    by = {t: pos[trails == t] for t in uniq}
+    vals = np.empty(n_boot)
+    for i in range(n_boot):
+        drawn = rng.choice(uniq, len(uniq), replace=True)
+        p = np.concatenate([by[t] for t in drawn])
+        b = rng.choice(neg, len(neg), replace=True)
+        vals[i] = ((p[:, None] < b[None, :]).sum()
+                   + 0.5 * (p[:, None] == b[None, :]).sum()) / (len(p) * len(b))
+    return (float(np.quantile(vals, alpha / 2.0)),
+            float(np.quantile(vals, 1.0 - alpha / 2.0)))

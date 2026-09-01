@@ -1,3 +1,29 @@
+> ## STATUS BANNER, read before anything below
+>
+> This file is the historical record of audits 1 to 6. Parts of it are
+> **superseded**. Retracted claims are deliberately preserved, with the
+> reason, because the instrumentation defects that produced them are the
+> most useful content in this project.
+>
+> **The current conclusions live in `audit7/FINDINGS.md` and
+> `VALIDATION_CONTRACT.md`.** Where this file and those disagree, those
+> win.
+>
+> Superseded in this file, each marked inline where it appears:
+>
+> | Claim below | Status |
+> |---|---|
+> | "Nothing here has been validated against real route data" | superseded; audits 4 to 7 use real streams |
+> | AUC(A\|D) values, including 0.986 at 6 km | RETRACTED, biased upward 0.02 to 0.03 by an artificially easy negative class. Honest value 0.962 [0.934, 0.982] |
+> | "Real data cannot decide" the resolution question | RETRACTED; a paired test decides it. The effect is real and negligible, 0.0057 of retrieval percentile favouring 150 m |
+> | 70 m is empirically optimal | never true, and explicitly denied below; 70 m is a conservative structure-preserving choice |
+> | 0.03 is the optimal alignment band | RETRACTED as "optimal"; it is a defensible engineering choice sitting just below measured drift |
+> | Band protects against the staircase | RETRACTED in audit 6, reconfirmed audit 7: identical scores at every band |
+> | Shape recovery degrades with length | RETRACTED; it improves |
+> | Archetype similarity collapses with length | RETRACTED; a pooling artifact |
+> | Archetype labels are reliable | RETRACTED; 20 to 24 percent unstable |
+> | The matcher is fundamentally a shape matcher | RETRACTED; it is magnitude-first |
+
 # Parameter selection
 
 Every tolerance, weight and resolution in `segmatch` was chosen by
@@ -13,7 +39,8 @@ a factor of nearly two.
 
 There are no Strava credentials in the environment these sweeps run in,
 so the evaluation set is **synthetic**. Nothing here has been validated
-against real route data. `bench/real_data.py` exists to do exactly that
+against real route data. *(Superseded: audits 4 to 7 validate against
+real cached streams. This sentence describes audits 1 to 3 only.)* `bench/real_data.py` exists to do exactly that
 and needs no labels; see "Real-world validation" at the end.
 
 Three claims should be kept separate when reading this file:
@@ -554,7 +581,26 @@ name that says not to read it.
 Physical identity over the same range: AUC 0.914, 0.919, 0.929, 0.944,
 0.986 at 1000 through 6000 m.
 
+> **RETRACTED (audit 7).** Every AUC(A|D) figure in this file is biased
+> upward by 0.02 to 0.03. Category D required "different archetype AND
+> unmatched statistics", so geographically separate pairs that shared an
+> archetype or matched on statistics were routed into B or C and the
+> negative class was the easy remainder. Against a purely geometric
+> negative the honest values are 0.889, 0.897, 0.909, 0.912, 0.923,
+> 0.914 and **0.962 [0.934, 0.982]** at 1000 to 6000 m.
+
 ### Resolution stays at 70 m
+
+> **RETRACTED (closure pass).** "Real data cannot decide" was a
+> statement about an underpowered test, not about the data. Comparing
+> independent confidence intervals across resolutions is weak; scoring
+> the SAME pairs at every resolution cancels between-pair variance. On
+> 745 real positives that paired test does decide: 150 m beats 70 m by
+> 0.0057 of retrieval percentile at t = 5.1. Statistically real,
+> practically negligible, and set against a twentyfold synthetic
+> advantage for 70 m at a structure scale these streams cannot record.
+> The AUC(A|D) numbers in this paragraph also carry the negative-class
+> bias retracted above.
 
 Real data cannot decide this question, and saying so matters more than
 the numbers. On the 6 km corpus every resolution from 50 to 150 m gives

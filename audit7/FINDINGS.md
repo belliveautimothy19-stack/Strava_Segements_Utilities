@@ -332,3 +332,135 @@ Criterion 7 of the audit-7 GREEN list is therefore **withdrawn as a
 GREEN blocker** and retained as a precondition on archetype claims only.
 Collecting data to stabilize it would be solving a problem the product
 does not have.
+
+---
+
+# Engineering sign-off pass
+
+Production frozen and probed adversarially rather than reviewed. No
+production defect found. Two defects found in the audit's own reporting,
+both in the direction of overstating confidence.
+
+## Adversarial probe of production: nothing found
+
+| Probe | Result |
+|---|---|
+| Flat profile, two-point stream, step function, pure ramp, single spike | self-match 0.000000, no exceptions |
+| Self-match over 136 real windows | worst 0.026 |
+| Reversed copy recognised, and reported as reverse | 40 of 40 |
+| Score monotone in perturbation magnitude | monotone over sigma 0 to 0.8 |
+| Profile length vs input length | exact, 0.000 percent shortfall |
+| Effective `min_ratio` | 0.751 against 0.750 configured, a 0.1 percent boundary effect on a parameter that is itself a product choice |
+| Score asymmetry, target and candidate swapped | median 0.60, but AUC moves only 0.8853 to 0.8912 with overlapping intervals, so no conclusion depends on the convention |
+
+## The 6 km interval was invalid
+
+The unit of replication is the trail. Resampling pairs treats windows cut
+from one trail as independent draws. Measured against a cluster bootstrap
+over trails:
+
+    window   pair CI width   cluster CI width   understatement
+     1000 m      0.0336           0.0507             1.5x
+     2200 m      0.0371           0.0685             1.8x
+
+At 6 km every positive comes from one trail, and the cluster bootstrap
+correctly **refuses**:
+
+    L=6000  AUC(A|N)=0.9618  pair CI [0.9342, 0.9824]
+                             cluster CI INESTIMABLE (1 trail)
+                             NOT ADEQUATE
+
+**The 6 km headline has a point estimate and no valid interval.** The
+`[0.934, 0.982]` reported in audit 7 was computed over pseudo-replicates
+of a single trail. Audit 7's adequacy verdict of "yes" at 6 km is
+withdrawn; the correct verdict is NOT ADEQUATE, on the criterion audit 7
+itself wrote.
+
+## And the fix had the same bug in it
+
+The first cluster implementation labelled clusters by route PAIRING, and
+reported three trails at 6 km: A x B, A x A and B x B, where A and B are
+two recordings of one trail. Pseudo-replication regained through the
+label. Trail ids now come from geography, and the corpus resolves to five
+trails with 19476565994 and 19670306718 sharing one.
+
+This is the same defect twice in ten minutes, which is the argument for
+the assertion rather than the care.
+
+## Claims we are entitled to make about resolution
+
+Not "150 m is optimal". Not "70 m is empirically optimal". The defensible
+statement has three parts:
+
+1. **On this corpus, coarser is very slightly better.** Paired, 745
+   positives: 150 m beats 70 m by 0.0057 of retrieval percentile, t=5.1.
+   The t is inflated by pseudo-replication; the effect size is not.
+   0.6 percentage points.
+2. **At structure scales these streams cannot record, finer is decisively
+   better.** Verified synthetic probe: a gain-matched 60 m staircase
+   separates from a ramp by 4.10 at 70 m and 0.20 at 150 m, with
+   `gain_dev` and `len_dev` exactly zero. Real terrain in this region has
+   that structure, 34 percent of grade variance below 60 m on a
+   6 m-sampled route; the long streams are sampled at 30 to 33 m and do
+   not record it.
+3. **The corpus cannot adjudicate between 1 and 2**, because no stream
+   long enough for 6 km windows is sampled finely enough to carry the
+   structure in question.
+
+So 70 m is best described as **structure-preserving and conservative**:
+the finest resolution whose cost on measured data is negligible and whose
+benefit at unmeasured scales is large. It is a deliberate engineering
+choice under uncertainty, not an optimum. Its cost is quantified: 0.6
+percentage points of retrieval percentile and roughly 3x the runtime of
+150 m at 6 km.
+
+## The alignment band, closed out
+
+1. **What it accommodates.** Longitudinal disagreement between two
+   recordings of the same ground: odometry drift, GPS error and route
+   choice. Not a constant offset, which the offset grid search absorbs.
+2. **Does it scale correctly?** Yes. Measured within-window drift is
+   40.9 m at 1 km, 88.6 m at 3 km and 170.8 m at 6 km, p50, so drift is
+   proportional to window length and a fractional band is the right
+   shape. Below about 1170 m the band floors at one comparison sample and
+   is `res_m / 2` instead, which is also right: warping by less than one
+   sample is meaningless.
+3. **Is 0.03 defensible?** Yes, and it is not optimal. It covers roughly
+   p50 to p85 of measured drift depending on length, sitting just below
+   p90.
+4. **Is there evidence to change it now?** No. The drift measurement is
+   one trail pair, 5 windows at 6 km. The AUC sweep favours wider, but
+   beyond the physical drift a wider band only helps unrelated terrain
+   align, and the nearest negative falls from 1.920 to 1.438 across it.
+5. **What would justify a change.** The new corpus reproducing p90
+   within-window drift above 0.035 of window length on at least 3
+   independent trails, with the paired AUC improvement holding under a
+   cluster bootstrap. Then 0.04 to 0.05, chosen to cover measured drift,
+   not to maximise a score. Under the holdout rule in PROTOCOL.md.
+
+**0.03 is a defensible engineering choice, not an optimum.**
+
+## The comparison-length boundary
+
+`n_cmp` caps at 512, so above `512 * res_m / 2` = 17,920 m at res 70 the
+shape comparison samples coarser than `res_m / 2`.
+
+Classification: **a documented operating boundary, not a defect.** The
+product length is 6 km, where `n_cmp` is 171. The cap bounds DTW cost,
+which is quadratic in `n_cmp`; removing it would make a 30 km target
+roughly three times more expensive for a regime nobody uses. It is now
+pinned by a test so it cannot be forgotten, and it is stated here rather
+than left to be rediscovered.
+
+## What is NOT a product requirement
+
+Verified absent from `segmatch/`, the scoring function and the CLI:
+
+- discrete terrain archetype classification (audit instrument only)
+- steepness-blind shape similarity (explicitly not the objective;
+  measured correlation 0.13)
+- any terrain taxonomy
+- matching every local feature: one 500 m feature scores 1.556 where a
+  diffuse difference scores 0.193, and for climbing demand that is correct
+- invariance to isolated anomalies: an anomaly is real demand
+- correctness above 17,920 m
