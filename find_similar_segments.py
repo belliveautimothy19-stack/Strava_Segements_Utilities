@@ -2,11 +2,41 @@
 """
 find_similar_segments.py
 
-Finds Strava running segments near a given location whose ELEVATION/GRADE
-PROFILE most closely matches a target GPX file - not just similar average
-grade or distance, but similar overall shape (punchy start, rolling middle,
-steep pinch, flat finish, etc.), using dynamic time warping (DTW) on
-resampled grade sequences.
+Finds Strava running segments near a given location whose elevation and
+grade profile most closely matches a target GPX file. Not just a similar
+average grade or distance, but a similar ordered shape: punchy start,
+rolling middle, steep pinch, flat finish.
+
+HOW A MATCH IS DECIDED
+----------------------
+Both the target and every candidate are converted to a normalized
+representation first: elevation resampled onto a uniform arc-length grid,
+and grade estimated as a least squares slope over a fixed physical scale
+(--grade-res-m, default 120 m). That step is what makes a target recorded
+at 1 m GPS spacing comparable to a Strava stream at 10 m spacing.
+
+Windows of varying length and offset are then generated across each
+candidate, screened with a lower bound that provably never exceeds the
+true distance, and the survivors scored on four named terms:
+
+  shape        ordered grade sequence, compared by dynamic time warping
+               under a bounded alignment tolerance (--max-shift-frac)
+  composition  grade distribution regardless of order, exact
+               Wasserstein-1
+  vertical     ascent and descent against the target, measured at a
+               fixed spatial interval so it describes the hill rather
+               than the recording device
+  length       how far the window is from the target length
+
+The winning window is then refined off the search grid by local descent,
+so the reported extent is not quantized to the offset and length steps.
+
+Reported scores are placed against a null model built by scoring random
+windows from the same candidate pool, so a weak match is labelled weak
+instead of merely being ranked first.
+
+Parameter choices are documented, with the measurements behind them, in
+PARAMETERS.md. Tests covering the adversarial cases are in tests/.
 
 --------------------------------------------------------------------------
 ONE-TIME SETUP
@@ -38,9 +68,10 @@ USAGE
 --radius-km controls how big a grid of search boxes to scan (bigger =
 more API calls = slower, due to Strava rate limits of 100 req/15min).
 
-Output: ranked list of candidate segments with name, distance, elevation
-gain, average grade, DTW similarity score (lower = more similar shape),
-and a direct Strava URL.
+Output: ranked candidate segments with name, distance, gain and loss,
+which direction to run them, a per-term score breakdown, a match-quality
+line placing the score against the null model, road access, and a direct
+Strava URL.
 """
 
 import argparse
@@ -56,6 +87,10 @@ from pathlib import Path
 import numpy as np
 import requests
 import gpxpy
+
+from segmatch.match import (MatchConfig, prepare_target,
+                             match_segment, null_scores)
+from segmatch.profile import build_profile, vertical_change
 
 TOKEN_FILE = Path.home() / ".strava_segment_matcher_tokens.json"
 
@@ -243,85 +278,6 @@ def load_gpx_profile(path):
               f"{path} lack elevation; interpolating across them.")
         elevs[bad] = np.interp(cum_dist[bad], cum_dist[~bad], elevs[~bad])
     return cum_dist, elevs
-
-
-def resample_grade_profile(cum_dist, elevs, bin_size_m):
-    """
-    Bin the elevation profile into FIXED REAL-DISTANCE chunks (e.g. every
-    0.25 mi) and return the grade (%) within each chunk, in order.
-
-    This is deliberately distance-based rather than point-count-based:
-    resampling to a fixed point count means longer windows get coarser
-    per-point resolution and shorter windows get finer resolution, which
-    is an artifact of window length, not a real property of the climb.
-    Binning by fixed physical distance keeps resolution consistent
-    regardless of window length, so 'first quarter mile at 8%, next
-    quarter mile at 2%' means the same thing everywhere it's compared \u2014
-    sequence AND composition are preserved, not just the average grade.
-    """
-    total = cum_dist[-1]
-    if total <= 0:
-        return None
-    n_bins = max(2, round(total / bin_size_m))
-    edges = np.linspace(0, total, n_bins + 1)
-    binned_elev = np.interp(edges, cum_dist, elevs)
-    bin_dist = np.diff(edges)
-    bin_dist[bin_dist == 0] = 1e-6
-    # NB: each bin's grade is the secant slope between its two edge
-    # elevations - the interior of the bin is not consulted at all. That is
-    # the correct NET grade for the bin, but it does mean barometric jitter
-    # landing exactly on an edge feeds straight through (about +/-0.15% for
-    # 0.6 m of jitter across a 0.25 mi bin, so: small but not zero).
-    grades = np.diff(binned_elev) / bin_dist * 100
-    return grades
-
-
-# Sakoe-Chiba band, as a fraction of the longer sequence. Bounds how far
-# the alignment may drift from the diagonal.
-#
-# Without a band, DTW is free to stretch a single bin to cover arbitrarily
-# many, which makes it BLIND to how physically long each grade section is:
-# a target of "1.25 mi at 8% then 2.5 mi at 2%" scores a perfect 0.000
-# against a window holding only 0.25 mi at 8%, and also against one holding
-# 3.0 mi at 8%. That defeats the whole point of binning by fixed real
-# distance. A band of 0.15 keeps local time-warping (which is what we want:
-# a climb that ramps up slightly sooner still matches) while forcing
-# section lengths to roughly correspond.
-DTW_BAND_FRAC = 0.15
-
-
-def dtw_distance(seq_a, seq_b, band_frac=DTW_BAND_FRAC):
-    """Banded DTW on 1D sequences (grade %), no external deps.
-
-    Returns the accumulated |grade| difference along the optimal warping
-    path, divided by max(n, m). That divisor is a length normalizer, not
-    the true path length (which lies between max(n,m) and n+m-1); it is
-    kept because it is stable across the window lengths we compare.
-    """
-    seq_a = np.asarray(seq_a, dtype=float)
-    seq_b = np.asarray(seq_b, dtype=float)
-    n, m = len(seq_a), len(seq_b)
-    if n == 0 or m == 0:
-        return float("inf")
-    # Band must be at least |n-m| wide or no path can reach the far corner.
-    w = max(int(round(band_frac * max(n, m))), abs(n - m), 1)
-    cost = np.full((n + 1, m + 1), np.inf)
-    cost[0, 0] = 0.0
-    for i in range(1, n + 1):
-        lo, hi = max(1, i - w), min(m, i + w)
-        # Vectorize the |a_i - b_j| row; the recurrence itself is sequential
-        # because cost[i, j] depends on cost[i, j-1].
-        drow = np.abs(seq_b[lo - 1:hi] - seq_a[i - 1])
-        prev = cost[i - 1]
-        cur = cost[i]
-        left = np.inf
-        for k, j in enumerate(range(lo, hi + 1)):
-            best = prev[j] if prev[j] < prev[j - 1] else prev[j - 1]
-            if left < best:
-                best = left
-            left = drow[k] + best
-            cur[j] = left
-    return float(cost[n, m] / max(n, m))
 
 
 # --------------------------------------------------------------------------
@@ -540,7 +496,7 @@ def parse_segment_id(url_or_id):
 
 def get_segment_meta(token, segment_id):
     """Fetch a segment's basic metadata (name, etc.) for labeling the GPX.
-    Returns a dict or {} on failure. Not cached \u2014 it's one call, rarely
+    Returns a dict or {} on failure. Not cached it's one call, rarely
     repeated."""
     headers = {"Authorization": f"Bearer {token}"}
     try:
@@ -614,95 +570,6 @@ def export_segment_gpx(token, segment_id, out_path, reverse=False,
 # Main
 # --------------------------------------------------------------------------
 
-def total_gain_loss(elevs):
-    """Total ascent and descent (meters) from an elevation array.
-
-    NOTE: this is sampling-density dependent - the same hill recorded at
-    1 m spacing reports several times the gain it does at 25 m spacing,
-    because every scrap of barometric jitter is counted as real climbing.
-    Use vertical_change() for anything that compares two profiles; this
-    remains only for callers that already hold a uniformly-sampled array.
-    """
-    diffs = np.diff(np.asarray(elevs, dtype=float))
-    diffs = diffs[np.isfinite(diffs)]
-    gain = np.sum(diffs[diffs > 0])
-    loss = -np.sum(diffs[diffs < 0])
-    return float(gain), float(loss)
-
-
-# Elevation is re-sampled to this fixed spatial interval before ascent and
-# descent are accumulated. Gain is otherwise not a well-defined property of
-# terrain: it grows without bound as sampling gets denser, because GPS/
-# barometric jitter accumulates. Fixing the interval makes the number a
-# property of the HILL rather than of the recording device, and - critically
-# - makes the target's gain and a candidate window's gain measured the same
-# way, so their ratio means something.
-VERT_RESAMPLE_M = 25.0
-
-
-def vertical_change(cum_dist, elevs, resample_m=VERT_RESAMPLE_M):
-    """Total ascent/descent (m) measured at a fixed spatial interval.
-
-    Returns (gain, loss) as positive magnitudes."""
-    cum_dist = np.asarray(cum_dist, dtype=float)
-    elevs = np.asarray(elevs, dtype=float)
-    if cum_dist.size < 2:
-        return 0.0, 0.0
-    span = float(cum_dist[-1] - cum_dist[0])
-    if span <= 0:
-        return 0.0, 0.0
-    # Interpolate ACROSS non-finite elevations rather than letting them
-    # propagate. Dropping non-finite diffs afterwards is not enough: a
-    # single NaN poisons both adjacent diffs, and an all-NaN profile then
-    # returns a perfectly quiet 0.0 that makes the gain term inert.
-    good = np.isfinite(elevs)
-    if not good.any():
-        return 0.0, 0.0
-    if not good.all():
-        elevs = np.interp(cum_dist, cum_dist[good], elevs[good])
-    n = max(2, int(round(span / resample_m)) + 1)
-    grid = np.linspace(cum_dist[0], cum_dist[-1], n)
-    e = np.interp(grid, cum_dist, elevs)
-    d = np.diff(e)
-    d = d[np.isfinite(d)]
-    return float(d[d > 0].sum()), float(-d[d < 0].sum())
-
-
-def wasserstein_1d(a, b, n=100):
-    """
-    1D Earth Mover's (Wasserstein-1) distance between two sets of grade
-    values, via quantile / inverse-CDF matching. No scipy dependency.
-
-    This scores how similar two climbs' grade COMPOSITIONS are while
-    ignoring the ORDER the grades occur in \u2014 the complement to the DTW
-    shape score, which cares about order. It's built on distributions,
-    so it correctly treats 7%-vs-8% as a near-miss and 2%-vs-10% as a
-    big miss, unlike a naive per-band difference that would call both
-    equally wrong.
-    """
-    a = np.sort(np.asarray(a, dtype=float))
-    b = np.sort(np.asarray(b, dtype=float))
-    if a.size == 0 or b.size == 0:
-        return float("inf")
-    # Exact W1 = integral of |F_a(x) - F_b(x)| dx, evaluated on the merged
-    # support. The previous quantile-grid approximation mapped each sample
-    # set onto plotting positions k/(n-1), which squeezes both empirical
-    # CDFs inward and biases the result - by ~10% on small bin counts, and
-    # by a DIFFERENT amount for each window length, since window bin counts
-    # vary with the length being tried.
-    allv = np.concatenate([a, b])
-    allv.sort()
-    if allv.size < 2:
-        return 0.0
-    cdf_a = np.searchsorted(a, allv[:-1], side="right") / a.size
-    cdf_b = np.searchsorted(b, allv[:-1], side="right") / b.size
-    return float(np.sum(np.abs(cdf_a - cdf_b) * np.diff(allv)))
-
-
-# Signed grade bands (%) for the human-readable composition breakdown.
-# These are for DISPLAY ONLY \u2014 the actual distribution scoring uses EMD
-# above, which needs no band edges. Extends below zero so recovery/
-# descent sections land in their own bands rather than being ignored.
 GRADE_BANDS = [
     (-100, 0, "<0%"),
     (0, 2, "0-2%"),
@@ -805,7 +672,7 @@ _OVERPASS_ENDPOINTS = [
 ]
 _OVERPASS_HEADERS = {
     # Public Overpass instances commonly reject/deprioritize requests
-    # with no descriptive User-Agent \u2014 the default python-requests UA
+    # with no descriptive User-Agent the default python-requests UA
     # gets silently dropped or throttled on some mirrors.
     "User-Agent": "find_similar_segments/1.0 (personal training-route "
                    "matching script; contact: local use only)"
@@ -825,12 +692,12 @@ def road_distance_m_overpass(lat, lon, radii=(300, 1000, 2500), debug=False):
     Approximate distance (meters) from (lat, lon) to the nearest OSM
     road/track, by querying Overpass with progressively larger radii and
     returning the first that finds a hit. This is an access proxy, not a
-    precise perpendicular distance \u2014 good enough to distinguish
+    precise perpendicular distance good enough to distinguish
     'trailhead is basically at a road' from 'this is deep backcountry'.
 
     If every endpoint fails at the connection level (refused/timeout,
     not an HTTP error) on the very first candidate, Overpass is almost
-    certainly unreachable from this network entirely \u2014 e.g. a corporate
+    certainly unreachable from this network entirely e.g. a corporate
     firewall only allowlisting specific domains. Rather than repeat that
     failure (with its timeouts) for every remaining candidate, this
     disables further Overpass lookups for the rest of the run after one
@@ -884,7 +751,7 @@ def road_distance_m_overpass(lat, lon, radii=(300, 1000, 2500), debug=False):
     if not any_connection_succeeded:
         _OVERPASS_UNREACHABLE = True
         print("  [access] Overpass appears unreachable from this network "
-              "(every mirror failed to even connect) \u2014 disabling "
+              "(every mirror failed to even connect) disabling "
               "road-access checks for the rest of this run. This is "
               "likely a firewall/proxy blocking unlisted domains. Pass "
               "--no-access-check next time to skip this up front.")
@@ -910,7 +777,7 @@ def road_distance_m(lat, lon, google_api_key=None, debug=False):
 
     Returns one of:
       - a float distance in meters (road found),
-      - None (checked, but genuinely no road within range \u2014 Overpass
+      - None (checked, but genuinely no road within range Overpass
         path only; Google's nearestRoads has no range limit so this is
         rare there),
       - ACCESS_UNCHECKED (the lookup itself failed and we don't know).
@@ -921,13 +788,13 @@ def road_distance_m(lat, lon, google_api_key=None, debug=False):
             return round(dist)
         # Google's nearestRoads has no distance cap, so a null result
         # almost always means the CALL failed rather than "no road
-        # exists anywhere" \u2014 mark it unchecked rather than penalizing it
+        # exists anywhere" mark it unchecked rather than penalizing it
         # as if we'd confirmed it's remote.
         return ACCESS_UNCHECKED
     result = road_distance_m_overpass(lat, lon, debug=debug)
     # Overpass path already returns None for "checked, none within
     # 2.5km". But if the whole backend got disabled mid-run, it also
-    # returns None \u2014 flag that case as unchecked instead.
+    # returns None flag that case as unchecked instead.
     if result is None and _OVERPASS_UNREACHABLE:
         return ACCESS_UNCHECKED
     return result
@@ -946,9 +813,9 @@ def access_penalty(road_dist_m_value, near_m=400, far_m=1200):
       neither rewards nor punishes a segment.
     """
     if road_dist_m_value == ACCESS_UNCHECKED:
-        return 0.0  # neutral \u2014 don't distort ranking on missing data
+        return 0.0  # neutral don't distort ranking on missing data
     if road_dist_m_value is None:
-        return 3.0  # checked: genuinely no road found \u2014 treat as remote
+        return 3.0  # checked: genuinely no road found treat as remote
     d = road_dist_m_value
     if d <= near_m:
         return 0.0
@@ -963,145 +830,97 @@ def access_penalty(road_dist_m_value, near_m=400, far_m=1200):
 # Windowed subsequence matching (direction-aware, no hard descent filter)
 # --------------------------------------------------------------------------
 
-def find_best_window(seg_dist, seg_elev, seg_latlng, target_grade_seq,
-                      target_dist_m, bin_size_m, target_gain_m,
-                      min_frac=0.75, max_frac=1.15, length_steps=7,
-                      start_step_frac=0.02, w_shape=1.0, w_dist=0.6,
-                      w_gain=4.0, reversible=True):
-    """
-    Slide windows of varying length across a candidate segment's profile
-    and score each against the target.
-
-    By default (reversible=True) each window is scored in BOTH physical
-    running directions \u2014 as-recorded and reversed \u2014 and the better fit
-    wins, so a segment is never missed just because it was recorded in
-    the opposite direction; the result reports which way to run it. Set
-    reversible=False to score only the as-recorded direction.
-
-    The target's grade sequence is used as given by the caller.
-
-    Combined score blends three terrain signals:
-      shape (DTW, w_shape) \u2014 grade composition AND sequence
-      distribution (EMD, w_dist) \u2014 grade composition without sequence
-      gain (relative deviation, w_gain) \u2014 total vertical magnitude
-    combined = w_shape*dtw + w_dist*emd + w_gain*gain_deviation
-    (access proximity added separately by the caller.)
-
-    Returns (score, win_start_m, win_end_m, gain_ft, loss_ft, direction,
-    start_latlng, shape_score, dist_score, gain_dev, win_grade_seq), or
-    None if the segment is too short. gain_ft/loss_ft are in the chosen
-    running direction; direction is 'forward' or 'reverse' (the
-    candidate's recorded orientation).
-    """
-    total_len = seg_dist[-1]
-    if total_len < target_dist_m * min_frac:
+def _latlng_at(seg_dist, seg_latlng, dist_m):
+    """Lat/lon at a given distance along a segment, or None."""
+    if seg_latlng is None or len(seg_latlng) == 0:
         return None
+    lat = float(np.interp(dist_m, seg_dist, seg_latlng[:, 0]))
+    lon = float(np.interp(dist_m, seg_dist, seg_latlng[:, 1]))
+    return lat, lon
 
-    # target_gain_m is always the magnitude of the target's climb; when
-    # the caller orients the target downhill, the window's descent
-    # magnitude (its loss) is what should match it.
-    best = None
 
-    length_fracs = np.linspace(min_frac, max_frac, length_steps)
-    # np.linspace(0.75, 1.15, 7) yields 0.75, 0.817, 0.883, 0.95, 1.017,
-    # 1.083, 1.15 - it never lands on 1.0. The single most likely correct
-    # window length was the one length the search never tried.
-    if min_frac <= 1.0 <= max_frac:
-        length_fracs = np.unique(np.append(length_fracs, 1.0))
+def window_access(seg_dist, seg_latlng, start_m, end_m, google_api_key,
+                   debug=False):
+    """Road distance for a window, sampled at its start, middle and end.
 
-    # Clamp each trial length to the segment, then de-duplicate. Skipping
-    # over-long windows outright meant a segment even a few METRES shorter
-    # than the target could never be tried at its natural length: the 1.0x
-    # window was dropped and the best remaining length was 0.95x, whose bins
-    # span a different physical distance than the target's. Measured on a
-    # self-match, that turned a 0.166 score into 2.164.
-    win_lens = np.unique(np.minimum(target_dist_m * length_fracs, total_len))
+    Sampling only the start point reads a segment that begins at a car
+    park and climbs into the backcountry as fully accessible. Taking the
+    worst of three points along the window costs three lookups instead of
+    one and describes reachability of the whole window rather than of its
+    first metre.
 
-    for win_len in win_lens:
-        win_len = float(win_len)
-        step = max(target_dist_m * start_step_frac, 10)
-        starts = np.arange(0, total_len - win_len + 1e-9, step)
-        if len(starts) == 0:
-            starts = np.array([0.0])
-        # Ensure the final window reaches the segment's end; otherwise the
-        # last (up to one step) of every segment is never searched.
-        if starts[-1] < total_len - win_len - 1e-9:
-            starts = np.append(starts, total_len - win_len)
+    Returns a distance in metres, None (checked, no road found), or
+    ACCESS_UNCHECKED if every lookup failed.
+    """
+    pts = [p for p in (_latlng_at(seg_dist, seg_latlng, start_m),
+                       _latlng_at(seg_dist, seg_latlng,
+                                  (start_m + end_m) / 2.0),
+                       _latlng_at(seg_dist, seg_latlng, end_m))
+           if p is not None]
+    if not pts:
+        return ACCESS_UNCHECKED
+    seen = []
+    for lat, lon in pts:
+        r = road_distance_m(lat, lon, google_api_key=google_api_key,
+                            debug=debug)
+        seen.append(r)
+    reals = [r for r in seen if isinstance(r, (int, float))]
+    if reals:
+        return max(reals)
+    if any(r is None for r in seen):
+        return None
+    return ACCESS_UNCHECKED
 
-        n_bins = max(2, int(round(win_len / bin_size_m)))
 
-        for start in starts:
-            end = start + win_len
-            # Interpolate the bin EDGES straight off the real stream.
-            # The previous code built a 100-point intermediate grid and
-            # re-interpolated the edges out of that; since
-            # resample_grade_profile only ever reads edge elevations, the
-            # intermediate grid discarded stream detail for no benefit and
-            # made the result depend on the target's bin count.
-            edges = np.linspace(start, end, n_bins + 1)
-            edge_elev = np.interp(edges, seg_dist, seg_elev)
-            widths = np.diff(edges)
-            widths[widths == 0] = 1e-6
-            fwd_grade_seq = np.diff(edge_elev) / widths * 100.0
-            rev_grade_seq = -np.flip(fwd_grade_seq)
+def impute_access_penalties(rows, key="road_dist"):
+    """Replace unchecked access readings with the median of the checked
+    ones, and report how many were substituted.
 
-            # Gain/loss from the real stream samples inside the window, at
-            # the same fixed spatial interval used for the target, so the
-            # two numbers are measured the same way and their ratio means
-            # something. Previously the target's gain came from the raw GPX
-            # (often 1-4 m spacing, jitter inflating it several-fold) while
-            # the window's came from a ~60-100 m decimated grid - a perfect
-            # self-match scored gain_dev = 50%.
-            lo_i = np.searchsorted(seg_dist, start, side="left")
-            hi_i = np.searchsorted(seg_dist, end, side="right")
-            w_d = np.concatenate(([start], seg_dist[lo_i:hi_i], [end]))
-            w_e = np.concatenate((
-                [np.interp(start, seg_dist, seg_elev)],
-                seg_elev[lo_i:hi_i],
-                [np.interp(end, seg_dist, seg_elev)]))
-            raw_gain_m, raw_loss_m = vertical_change(w_d, w_e)
+    Scoring an unchecked lookup as 0.0 gave it the same penalty as a
+    segment starting at the trailhead, so a segment whose lookup happened
+    to fail was rewarded with the best possible access score. With a
+    Google key any failed call returns ACCESS_UNCHECKED, so intermittent
+    failures quietly promoted segments over genuinely remote ones.
+    Substituting the median of what was actually measured is neutral in
+    the sense that matters: it neither rewards nor punishes relative to a
+    typical candidate.
 
-            # "forward" = run the window as-recorded; "reverse" = run it
-            # backward (gain/loss swap). Reversible tries both and keeps
-            # the better; otherwise only the as-recorded direction.
-            fwd_opt = ("forward", fwd_grade_seq, raw_gain_m, raw_loss_m)
-            rev_opt = ("reverse", rev_grade_seq, raw_loss_m, raw_gain_m)
-            options = [fwd_opt, rev_opt] if reversible else [fwd_opt]
+    Returns (n_imputed, imputed_value).
+    """
+    known = [r["penalty"] for r in rows if r[key] != ACCESS_UNCHECKED]
+    if not known:
+        return 0, 0.0
+    med = float(np.median(known))
+    n = 0
+    for r in rows:
+        if r[key] == ACCESS_UNCHECKED:
+            r["penalty"] = med
+            n += 1
+    return n, med
 
-            for direction, grade_seq, gain_m, loss_m in options:
-                shape_score = dtw_distance(target_grade_seq, grade_seq)
-                dist_score = wasserstein_1d(target_grade_seq, grade_seq)
 
-                # Gain term: relative deviation of the window's dominant
-                # vertical travel from the target's magnitude.
-                window_vert_m = max(gain_m, loss_m)
-                if target_gain_m > 0:
-                    gain_dev = abs(window_vert_m - target_gain_m) / target_gain_m
-                else:
-                    gain_dev = 0.0
-
-                score = (w_shape * shape_score
-                         + w_dist * dist_score
-                         + w_gain * gain_dev)
-
-                if best is None or score < best[0]:
-                    start_dist = end if direction == "reverse" else start
-                    start_latlng = None
-                    if seg_latlng is not None:
-                        lat = np.interp(start_dist, seg_dist, seg_latlng[:, 0])
-                        lon = np.interp(start_dist, seg_dist, seg_latlng[:, 1])
-                        start_latlng = (lat, lon)
-                    best = (score, start, end, gain_m * 3.28084,
-                            loss_m * 3.28084, direction, start_latlng,
-                            shape_score, dist_score, gain_dev,
-                            np.asarray(grade_seq))
-
-    return best
+def describe_significance(score, null):
+    """One line placing a score against the null distribution."""
+    if null is None or len(null) == 0:
+        return "no null model available"
+    better_than = float((null > score).mean())
+    if better_than >= 0.999:
+        verdict = "far better than random terrain"
+    elif better_than >= 0.99:
+        verdict = "clearly better than random terrain"
+    elif better_than >= 0.95:
+        verdict = "better than random terrain"
+    elif better_than >= 0.80:
+        verdict = "WEAK - only modestly better than random"
+    else:
+        verdict = "NOT DISTINGUISHABLE FROM RANDOM TERRAIN"
+    return f"better than {better_than * 100:.1f}% of random windows, {verdict}"
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--authorize", action="store_true",
                      help="Run one-time OAuth setup")
     ap.add_argument("--client-id", help="Strava API Client ID")
@@ -1110,90 +929,106 @@ def main():
     ap.add_argument("--lat", type=float, help="Search center latitude")
     ap.add_argument("--lon", type=float, help="Search center longitude")
     ap.add_argument("--radius-km", type=float, default=15.0,
-                     help="Search radius in km (default 15)")
-    ap.add_argument("--min-window-frac", type=float, default=0.75,
-                     help="Shortest matching window to accept, as a "
-                          "fraction of the target's length (default 0.75 "
-                          "\u2014 e.g. a 2.87mi window qualifies for a 3.83mi "
-                          "target)")
-    ap.add_argument("--max-window-frac", type=float, default=1.15,
-                     help="Longest matching window to try, as a fraction "
-                          "of the target's length (default 1.15)")
-    ap.add_argument("--max-segment-mult", type=float, default=3.0,
-                     help="Skip candidate segments longer than this "
-                          "multiple of the target's distance, to bound "
-                          "search cost on very long routes (default 3.0)")
-    ap.add_argument("--grade-bin-mi", type=float, default=0.25,
-                     help="Grade is computed in fixed real-distance "
-                          "chunks of this size (default 0.25 mi), so "
-                          "sequence and composition matter \u2014 alternating "
-                          "8%%/2%% grades score nothing like a flat 5%%, "
-                          "even with identical average grade")
-    ap.add_argument("--no-access-check", action="store_true",
-                     help="Skip the road-proximity lookup entirely "
-                          "(faster, but ranking won't account for how "
-                          "reachable a match actually is)")
-    ap.add_argument("--access-near-m", type=float, default=400,
-                     help="Distance (m) from a road within which a match "
-                          "counts as basically accessible, no penalty "
-                          "(default 400)")
-    ap.add_argument("--access-far-m", type=float, default=1200,
-                     help="Distance (m) from a road beyond which a match "
-                          "is heavily penalized as effectively "
-                          "unreachable (default 1200)")
-    ap.add_argument("--weight-shape", type=float, default=1.0,
-                     help="Weight on the DTW shape score \u2014 grade "
-                          "composition AND sequence (default 1.0)")
-    ap.add_argument("--weight-distribution", type=float, default=0.6,
-                     help="Weight on the grade-distribution (EMD) score "
-                          "\u2014 grade composition regardless of order "
-                          "(default 0.6; kept below shape so composition "
-                          "isn't double-counted)")
-    ap.add_argument("--weight-gain", type=float, default=4.0,
-                     help="Weight on relative total-gain deviation "
-                          "(default 4.0; scales a 0-1 fraction so it's "
-                          "comparable to the shape/distribution terms)")
-    ap.add_argument("--google-api-key", default=None,
-                     help="Google Maps Platform API key (Roads API "
-                          "enabled) for road-proximity checks. If not "
-                          "given, checks the GOOGLE_MAPS_API_KEY env var, "
-                          "then ~/.google_maps_api_key. Falls back to "
-                          "free OpenStreetMap/Overpass lookups if none "
-                          "of those are set.")
-    ap.add_argument("--debug-access", action="store_true",
-                     help="Print the actual HTTP status/error for each "
-                          "failed road-proximity lookup, instead of "
-                          "silently treating failures as 'no road'")
-    ap.add_argument("--top", type=int, default=10,
-                     help="Number of top matches to show")
-    ap.add_argument("--not-reversible", action="store_true",
-                     help="Only match candidates in their as-recorded "
-                          "direction. By default a segment is matched in "
-                          "whichever direction fits best (and the result "
-                          "tells you which way to run it); this disables "
-                          "that.")
-    ap.add_argument("--export", metavar="SEGMENT_URL_OR_ID", default=None,
-                     help="Export mode: given a Strava segment URL (or "
-                          "bare ID) from the search results, write that "
-                          "segment's geometry to a GPX file instead of "
-                          "searching. Use --output-path and --reverse to "
-                          "control the output.")
-    ap.add_argument("--output-path", default=None,
-                     help="Where to write the exported GPX (file path or "
-                          "directory). Defaults to the current directory "
-                          "with an auto-generated filename. Only used with "
-                          "--export.")
-    ap.add_argument("--reverse", action="store_true",
-                     help="With --export, flip the segment's direction "
-                          "before writing the GPX (e.g. to run a matched "
-                          "climb as a descent).")
-    ap.add_argument("--refresh", action="store_true",
-                     help="Ignore cached Strava data and re-fetch "
-                          "everything from the API, overwriting the cache "
-                          "(use when you think segments have changed)")
-    ap.add_argument("--clear-cache", action="store_true",
-                     help="Delete the entire on-disk Strava cache and "
-                          "exit")
+                     help="Half-width of the square search area in km "
+                          "(default 15, so a 30x30 km box)")
+
+    g = ap.add_argument_group("matching")
+    g.add_argument("--grade-res-m", type=float, default=120.0,
+                    help="Physical resolution (m) at which grade is "
+                         "estimated. Replaces the old --grade-bin-mi. "
+                         "Default 120 m was selected by sweeping 25 m to "
+                         "600 m against a labelled set: F1 peaks on a 90 "
+                         "to 120 m plateau at 0.955, against 0.903 at the "
+                         "old 0.25 mi (402 m) value. See PARAMETERS.md")
+    g.add_argument("--min-window-frac", type=float, default=0.75,
+                    help="Shortest matching window, as a fraction of the "
+                         "target length (default 0.75)")
+    g.add_argument("--max-window-frac", type=float, default=1.15,
+                    help="Longest matching window, as a fraction of the "
+                         "target length (default 1.15)")
+    g.add_argument("--length-steps", type=int, default=7,
+                    help="How many window lengths to try between the min "
+                         "and max fractions (default 7). 1.0x is always "
+                         "included regardless. The winner is then refined "
+                         "by local search, so this grid only has to be "
+                         "good enough to find the right basin")
+    g.add_argument("--start-step-frac", type=float, default=0.02,
+                    help="Window offset step, as a fraction of the target "
+                         "length (default 0.02). As with --length-steps, "
+                         "the winning offset is refined afterwards")
+    g.add_argument("--max-shift-frac", type=float, default=0.03,
+                    help="Alignment tolerance: how far a feature may sit "
+                         "from where the target has it and still match, "
+                         "as a fraction of target length (default 0.03). "
+                         "Wider bands let the shape term ignore how long "
+                         "each section physically is")
+    g.add_argument("--max-segment-mult", type=float, default=3.0,
+                    help="Skip candidate segments longer than this "
+                         "multiple of the target distance (default 3.0)")
+    g.add_argument("--matches-per-segment", type=int, default=1,
+                    help="Report up to this many non-overlapping windows "
+                         "from each segment (default 1). Raise it to find "
+                         "a pattern that repeats within one long segment")
+
+    w = ap.add_argument_group("scoring weights")
+    w.add_argument("--weight-shape", type=float, default=1.0,
+                    help="Weight on the ordered shape term (default 1.0)")
+    w.add_argument("--weight-distribution", type=float, default=0.6,
+                    help="Weight on grade composition regardless of order "
+                         "(default 0.6, kept below shape so composition "
+                         "is not double counted)")
+    w.add_argument("--weight-gain", type=float, default=4.0,
+                    help="Weight on vertical deviation (default 4.0; "
+                         "scales a dimensionless fraction to sit "
+                         "alongside the grade-percent terms)")
+    w.add_argument("--weight-length", type=float, default=2.0,
+                    help="Weight on window length deviation (default 2.0)")
+
+    a = ap.add_argument_group("access")
+    a.add_argument("--no-access-check", action="store_true",
+                    help="Skip road-proximity lookups entirely")
+    a.add_argument("--access-near-m", type=float, default=400,
+                    help="Within this many m of a road counts as "
+                         "accessible, no penalty (default 400)")
+    a.add_argument("--access-far-m", type=float, default=1200,
+                    help="Beyond this many m a match is heavily penalized "
+                         "(default 1200)")
+    a.add_argument("--max-road-dist", type=float, default=None,
+                    help="Hard gate: discard any match further than this "
+                         "many m from a road, instead of blending "
+                         "reachability into the score. Use when access is "
+                         "a constraint rather than a preference")
+    a.add_argument("--google-api-key", default=None,
+                    help="Google Maps Platform API key with the Roads API "
+                         "enabled. Falls back to GOOGLE_MAPS_API_KEY, "
+                         "then ~/.google_maps_api_key, then free "
+                         "OpenStreetMap/Overpass lookups")
+    a.add_argument("--debug-access", action="store_true",
+                    help="Print the HTTP status or error behind each "
+                         "failed road-proximity lookup")
+
+    o = ap.add_argument_group("output and cache")
+    o.add_argument("--top", type=int, default=10,
+                    help="Number of top matches to show")
+    o.add_argument("--null-samples", type=int, default=240,
+                    help="Random windows scored to build the reference "
+                         "distribution used for the match-quality line "
+                         "(default 240, 0 to disable)")
+    o.add_argument("--not-reversible", action="store_true",
+                    help="Only match candidates in their as-recorded "
+                         "direction")
+    o.add_argument("--export", metavar="SEGMENT_URL_OR_ID", default=None,
+                    help="Export mode: write a segment's geometry to GPX "
+                         "instead of searching")
+    o.add_argument("--output-path", default=None,
+                    help="Where to write the exported GPX. Only used with "
+                         "--export")
+    o.add_argument("--reverse", action="store_true",
+                    help="With --export, flip the segment's direction")
+    o.add_argument("--refresh", action="store_true",
+                    help="Ignore cached Strava data and re-fetch")
+    o.add_argument("--clear-cache", action="store_true",
+                    help="Delete the on-disk Strava cache and exit")
     args = ap.parse_args()
 
     if args.clear_cache:
@@ -1220,19 +1055,14 @@ def main():
             seg_id = parse_segment_id(args.export)
         except ValueError as e:
             sys.exit(str(e))
-
-        # Try to get a friendly name for the file/track
         meta = get_segment_meta(token, seg_id)
         seg_name = meta.get("name")
 
-        # Resolve output path: if a directory (or default), auto-name the
-        # file; if a full path ending in .gpx, use it as-is.
         def slugify(s):
             s = re.sub(r"[^\w\s-]", "", str(s)).strip().lower()
             return re.sub(r"[\s]+", "_", s) or f"segment_{seg_id}"
 
-        base_name = (f"{slugify(seg_name)}" if seg_name
-                     else f"segment_{seg_id}")
+        base_name = slugify(seg_name) if seg_name else f"segment_{seg_id}"
         if args.reverse:
             base_name += "_reversed"
         default_filename = f"{base_name}.gpx"
@@ -1245,171 +1075,203 @@ def main():
         elif out.lower().endswith(".gpx"):
             out_path = out
         else:
-            # treat as a directory that may not exist yet
             out_path = os.path.join(out, default_filename)
-
-        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)),
+                     exist_ok=True)
         try:
             written = export_segment_gpx(token, seg_id, out_path,
-                                          reverse=args.reverse, name=seg_name)
+                                          reverse=args.reverse,
+                                          name=seg_name)
         except (RuntimeError, OSError) as e:
             sys.exit(f"Export failed: {e}")
-
         label = seg_name or f"segment {seg_id}"
-        direction_note = " (reversed)" if args.reverse else ""
-        print(f"Exported {label}{direction_note} to:\n  {written}")
+        note = " (reversed)" if args.reverse else ""
+        print(f"Exported {label}{note} to:\n  {written}")
         return
 
     if not (args.gpx and args.lat is not None and args.lon is not None):
         sys.exit("Need --gpx, --lat, --lon (or use --authorize first)")
 
     token = get_access_token()
-
     google_api_key = args.google_api_key or get_google_api_key()
     if args.no_access_check:
         pass
     elif google_api_key:
         print("Using Google Roads API for road-proximity checks.\n")
     else:
-        print("No Google API key found \u2014 falling back to free "
+        print("No Google API key found, falling back to free "
               "OpenStreetMap/Overpass lookups (less reliable). Set "
               "--google-api-key, GOOGLE_MAPS_API_KEY, or "
               "~/.google_maps_api_key to use Google instead.\n")
 
-    cum_dist, elevs = load_gpx_profile(args.gpx)
-    target_dist_m = cum_dist[-1]
-    target_dist_mi = target_dist_m / 1609.34
-    target_gain_m, target_loss_m = vertical_change(cum_dist, elevs)
-    target_gain_ft = target_gain_m * 3.28084
-    bin_size_m = args.grade_bin_mi * 1609.34
-    target_grade_seq = resample_grade_profile(cum_dist, elevs, bin_size_m)
+    cfg = MatchConfig(
+        res_m=args.grade_res_m,
+        min_ratio=args.min_window_frac,
+        max_ratio=args.max_window_frac,
+        length_steps=args.length_steps,
+        stride_frac=args.start_step_frac,
+        max_shift_frac=args.max_shift_frac,
+        w_shape=args.weight_shape,
+        w_dist=args.weight_distribution,
+        w_gain=args.weight_gain,
+        w_len=args.weight_length,
+        top_k=args.matches_per_segment,
+        pool_size=max(16, 8 * args.matches_per_segment),
+    )
 
-    # Magnitude of the target's dominant vertical travel, used by the
-    # gain-consistency term regardless of running direction.
-    target_vert_m = max(target_gain_m, target_loss_m)
+    cum_dist, elevs = load_gpx_profile(args.gpx)
+    target = prepare_target(cum_dist, elevs, cfg)
+    if target is None:
+        sys.exit(f"{args.gpx} is too short to represent at "
+                 f"{args.grade_res_m:.0f} m resolution.")
+    target_dist_mi = target.length_m / 1609.34
 
     print(f"\nTarget: {args.gpx}")
     print(f"  Distance: {target_dist_mi:.2f} mi")
-    print(f"  Elevation gain: {target_gain_ft:.0f} ft "
-          f"(loss: {target_loss_m*3.28084:.0f} ft)")
-    print(f"  Avg grade: {(elevs[-1]-elevs[0])/cum_dist[-1]*100:.1f}%")
-    print(f"  Grade sequence (every {args.grade_bin_mi}mi): "
-          f"{np.round(target_grade_seq, 1).tolist()}")
-    print(f"  Grade composition: {format_band_breakdown(target_grade_seq)}")
+    print(f"  Gain: {target.gain_m * 3.28084:.0f} ft | "
+          f"Loss: {target.loss_m * 3.28084:.0f} ft "
+          f"(measured every {cfg.vert_resample_m:.0f} m)")
+    print(f"  Net grade: "
+          f"{(elevs[-1] - elevs[0]) / cum_dist[-1] * 100:.1f}%")
+    print(f"  Grade profile: {len(target.seq)} samples at "
+          f"{args.grade_res_m:.0f} m resolution")
+    print(f"  Grade composition: {format_band_breakdown(target.seq)}")
     if args.not_reversible:
-        print(f"  (matching as-recorded direction only)")
+        print("  (matching as-recorded direction only)")
     print()
 
-    min_seg_dist_mi = target_dist_mi * args.min_window_frac
-    max_seg_dist_mi = target_dist_mi * args.max_segment_mult
-
-    print(f"Pre-filtering to segments {min_seg_dist_mi:.1f}-"
-          f"{max_seg_dist_mi:.1f} mi long. No shape-based rejection at "
-          f"this stage \u2014 descents are scored in reverse, not thrown "
-          f"out.\n")
+    min_seg_mi = target_dist_mi * args.min_window_frac
+    max_seg_mi = target_dist_mi * args.max_segment_mult
+    print(f"Pre-filtering to segments {min_seg_mi:.1f}-{max_seg_mi:.1f} mi "
+          f"long. Descents are scored in reverse, not thrown out.\n")
 
     candidates = explore_segments(token, args.lat, args.lon, args.radius_km)
+    dist_filtered = [s for s in candidates
+                     if min_seg_mi <= s["distance"] / 1609.34 <= max_seg_mi]
+    print(f"{len(dist_filtered)} candidates pass the length filter. "
+          f"Fetching profiles and searching each...\n")
 
-    dist_filtered = []
-    for seg in candidates:
-        dist_mi = seg["distance"] / 1609.34
-        if min_seg_dist_mi <= dist_mi <= max_seg_dist_mi:
-            dist_filtered.append(seg)
-
-    print(f"{len(dist_filtered)} candidates pass length filter. "
-          f"Fetching profiles and searching for best matching window "
-          f"within each...\n")
-
-    scored = []
+    # Pass 1: fetch, build each profile once, and score terrain. Access
+    # lookups are deferred so the null model can be built from the same
+    # profiles without paying for network calls on segments that will not
+    # survive ranking.
+    rows, profiles = [], []
     for i, seg in enumerate(dist_filtered):
         stream = get_segment_stream(token, seg["id"])
         if stream is None:
             continue
         seg_dist, seg_elev, seg_latlng = stream
+        try:
+            prof = build_profile(seg_dist, seg_elev, cfg.res_m,
+                                  cfg.oversample, cfg.vert_resample_m)
+        except ValueError as e:
+            print(f"  [{i+1}/{len(dist_filtered)}] {seg['name']}: "
+                  f"unusable profile ({e})")
+            continue
+        if prof is None:
+            continue
+        profiles.append(prof)
 
-        result = find_best_window(
-            seg_dist, seg_elev, seg_latlng, target_grade_seq, target_dist_m,
-            bin_size_m, target_vert_m, min_frac=args.min_window_frac,
-            max_frac=args.max_window_frac, w_shape=args.weight_shape,
-            w_dist=args.weight_distribution, w_gain=args.weight_gain,
-            reversible=not args.not_reversible,
-        )
-        if result is None:
+        matches = match_segment(seg_dist, seg_elev, target, cfg,
+                                 profile=prof)
+        if not matches:
             print(f"  [{i+1}/{len(dist_filtered)}] {seg['name']}: "
                   f"too short to contain a qualifying window")
             continue
-
-        score, win_start_m, win_end_m, gain_ft, loss_ft, direction, \
-            start_latlng, shape_score, dist_score, gain_dev, \
-            win_grade_seq = result
-
-        road_dist = None
-        penalty = 0.0
-        if not args.no_access_check and start_latlng is not None:
-            road_dist = road_distance_m(*start_latlng,
-                                         google_api_key=google_api_key,
-                                         debug=args.debug_access)
-            penalty = access_penalty(road_dist, near_m=args.access_near_m,
-                                       far_m=args.access_far_m)
-
-        final_score = score + penalty
-        scored.append((final_score, score, penalty, road_dist, seg,
-                        win_start_m, win_end_m, gain_ft, loss_ft, direction,
-                        shape_score, dist_score, gain_dev, win_grade_seq))
-
-        access_note = (f"road ~{road_dist}m"
-                        if isinstance(road_dist, (int, float))
-                        else "no road within 2.5km"
-                        if road_dist is None and not args.no_access_check
-                        else "access unchecked")
+        for m in matches:
+            rows.append({"seg": seg, "m": m, "seg_dist": seg_dist,
+                         "seg_latlng": seg_latlng, "road_dist": None,
+                         "penalty": 0.0})
+        best = matches[0]
         print(f"  [{i+1}/{len(dist_filtered)}] {seg['name']}: "
-              f"terrain {score:.2f} (shape {shape_score:.2f}/dist "
-              f"{dist_score:.2f}/gain {gain_dev*100:.0f}%) + access "
-              f"{penalty:.2f} = {final_score:.2f} ({direction}, "
-              f"{access_note})")
+              f"terrain {best.score:.2f} (shape {best.shape:.2f}/comp "
+              f"{best.dist:.2f}/vert {best.gain_dev * 100:.0f}%/len "
+              f"{best.len_dev * 100:.0f}%) {best.direction}")
         time.sleep(0.3)
 
-    scored.sort(key=lambda x: x[0])
+    if not rows:
+        print("\nNo scoreable candidates found.")
+        return
 
-    print(f"\n{'='*70}")
-    print(f"TOP {min(args.top, len(scored))} MATCHES "
-          f"(lower combined score = more similar shape + more reachable)")
-    print(f"{'='*70}\n")
+    null = None
+    if args.null_samples > 0:
+        null = null_scores(profiles, target, cfg, n=args.null_samples)
+        if len(null):
+            print(f"\nNull model: {len(null)} random windows from the same "
+                  f"candidates score between {null.min():.2f} and "
+                  f"{null.max():.2f} (median {np.median(null):.2f}).")
 
-    for rank, (final_score, terrain_score, penalty, road_dist, seg,
-               win_start_m, win_end_m, gain_ft, loss_ft, direction,
-               shape_score, dist_score, gain_dev, win_grade_seq) in \
-            enumerate(scored[:args.top], 1):
-        win_start_mi = win_start_m / 1609.34
-        win_end_mi = win_end_m / 1609.34
-        win_len_mi = win_end_mi - win_start_mi
-        net_avg_grade = (gain_ft - loss_ft) / (win_len_mi * 5280) * 100
+    # Pass 2: access lookups, only for the best terrain matches, since
+    # each one now costs three network calls.
+    rows.sort(key=lambda r: r["m"].score)
+    checked = rows[:max(args.top * 3, args.top)]
+    if not args.no_access_check:
+        print(f"\nChecking road access for the top {len(checked)} "
+              f"terrain matches (3 points each)...")
+        for r in checked:
+            r["road_dist"] = window_access(
+                r["seg_dist"], r["seg_latlng"], r["m"].start_m,
+                r["m"].end_m, google_api_key, debug=args.debug_access)
+            r["penalty"] = access_penalty(r["road_dist"],
+                                           near_m=args.access_near_m,
+                                           far_m=args.access_far_m)
+        n_imputed, med = impute_access_penalties(checked)
+        if n_imputed:
+            print(f"  {n_imputed} of {len(checked)} lookups failed; using "
+                  f"the median measured penalty ({med:.2f}) for those "
+                  f"rather than treating them as roadside.")
+        if args.max_road_dist is not None:
+            before = len(checked)
+            checked = [r for r in checked
+                       if not isinstance(r["road_dist"], (int, float))
+                       or r["road_dist"] <= args.max_road_dist]
+            print(f"  --max-road-dist {args.max_road_dist:.0f} m gate: "
+                  f"{before - len(checked)} of {before} matches discarded.")
+
+    for r in checked:
+        r["final"] = r["m"].score + r["penalty"]
+    checked.sort(key=lambda r: r["final"])
+
+    print(f"\n{'=' * 72}")
+    print(f"TOP {min(args.top, len(checked))} MATCHES "
+          f"(lower combined score = closer terrain, more reachable)")
+    print(f"{'=' * 72}\n")
+
+    for rank, r in enumerate(checked[:args.top], 1):
+        m, seg = r["m"], r["seg"]
+        start_mi = m.start_m / 1609.34
+        end_mi = m.end_m / 1609.34
+        gain_ft, loss_ft = m.gain_m * 3.28084, m.loss_m * 3.28084
         seg_total_mi = seg["distance"] / 1609.34
         url = f"https://www.strava.com/segments/{seg['id']}"
-        access_str = (f"~{road_dist}m from a road"
-                       if isinstance(road_dist, (int, float))
-                       else "no road within 2.5km"
-                       if road_dist is None and not args.no_access_check
-                       else "access not confirmed")
-        print(f"{rank}. {seg['name']}  (segment is {seg_total_mi:.1f} mi total)")
-        leg_is_climb = gain_ft >= loss_ft
-        leg_word = "CLIMB" if leg_is_climb else "DESCENT"
-        if direction == "reverse":
-            print(f"   Run the segment BACKWARD ({leg_word}) \u2014 start at "
-                  f"mile {win_end_mi:.2f}, finish at mile {win_start_mi:.2f}")
+        if isinstance(r["road_dist"], (int, float)):
+            access_str = f"~{r['road_dist']:.0f} m from a road"
+        elif r["road_dist"] is None and not args.no_access_check:
+            access_str = "no road found nearby"
         else:
-            print(f"   Run the segment as-recorded ({leg_word}) \u2014 mile "
-                  f"{win_start_mi:.2f} to {win_end_mi:.2f} ({win_len_mi:.2f} mi)")
-        vert_ft = max(gain_ft, loss_ft)
-        target_vert_ft = max(target_gain_m, target_loss_m) * 3.28084
+            access_str = "access not confirmed"
+
+        print(f"{rank}. {seg['name']}  "
+              f"(segment is {seg_total_mi:.1f} mi total)")
+        leg = "CLIMB" if gain_ft >= loss_ft else "DESCENT"
+        if m.direction == "reverse":
+            print(f"   Run the segment BACKWARD ({leg}): start at mile "
+                  f"{end_mi:.2f}, finish at mile {start_mi:.2f}")
+        else:
+            print(f"   Run the segment as-recorded ({leg}): mile "
+                  f"{start_mi:.2f} to {end_mi:.2f} "
+                  f"({(end_mi - start_mi):.2f} mi)")
         print(f"   Gain: {gain_ft:.0f} ft | Loss: {loss_ft:.0f} ft | "
-              f"Grade: {net_avg_grade:.1f}% "
-              f"(target vertical: {target_vert_ft:.0f} ft)")
-        print(f"   Grade composition: {format_band_breakdown(win_grade_seq)}")
-        print(f"   Scores \u2014 shape {shape_score:.2f} | distribution "
-              f"{dist_score:.2f} | gain dev {gain_dev*100:.0f}% | "
-              f"access {penalty:.2f} | COMBINED {final_score:.2f}")
+              f"length {m.length_ratio * 100:.0f}% of target "
+              f"(target {target.gain_m * 3.28084:.0f} ft up / "
+              f"{target.loss_m * 3.28084:.0f} ft down)")
+        print(f"   Grade composition: {format_band_breakdown(m.grade_seq)}")
+        print(f"   Scores: shape {m.shape:.2f} | composition {m.dist:.2f} "
+              f"| vertical {m.gain_dev * 100:.0f}% | length "
+              f"{m.len_dev * 100:.0f}% | access {r['penalty']:.2f} "
+              f"| COMBINED {r['final']:.2f}")
+        print(f"   Match quality: {describe_significance(m.score, null)}")
+        print(f"   Access: {access_str}")
         print(f"   {url}\n")
 
 
