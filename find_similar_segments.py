@@ -3,7 +3,7 @@
 find_similar_segments.py
 
 Finds Strava running segments near a given location whose ELEVATION/GRADE
-PROFILE most closely matches a target GPX file — not just similar average
+PROFILE most closely matches a target GPX file - not just similar average
 grade or distance, but similar overall shape (punchy start, rolling middle,
 steep pinch, flat finish, etc.), using dynamic time warping (DTW) on
 resampled grade sequences.
@@ -139,7 +139,7 @@ def do_authorize(client_id, client_secret):
         pass
     print(
         "After approving, you'll land on a page at localhost that fails "
-        "to load. That's expected — copy the 'code' parameter out of the "
+        "to load. That's expected - copy the 'code' parameter out of the "
         "browser's address bar.\n"
         "Example: http://localhost/?state=&code=THIS_PART&scope=...\n"
     )
@@ -161,7 +161,7 @@ def do_authorize(client_id, client_secret):
     tokens["client_secret"] = client_secret
     TOKEN_FILE.write_text(json.dumps(tokens, indent=2))
     os.chmod(TOKEN_FILE, 0o600)
-    print(f"Saved tokens to {TOKEN_FILE}. You're set — run the script "
+    print(f"Saved tokens to {TOKEN_FILE}. You're set - run the script "
           f"again without --authorize.")
 
 
@@ -226,7 +226,23 @@ def load_gpx_profile(path):
                          points[i].latitude, points[i].longitude)
         cum_dist.append(cum_dist[-1] + d)
         elevs.append(points[i].elevation)
-    return np.array(cum_dist), np.array(elevs)
+
+    cum_dist = np.asarray(cum_dist, dtype=float)
+    elevs = np.asarray([np.nan if e is None else e for e in elevs],
+                        dtype=float)
+    # A GPX with missing <ele> values otherwise either crashes on None
+    # arithmetic or - worse - silently reports zero gain, because every
+    # NaN comparison is False so the ascent filter selects nothing. That
+    # drives target_vert_m to 0, which makes the gain term inert without
+    # any warning at all.
+    bad = ~np.isfinite(elevs)
+    if bad.all():
+        sys.exit(f"{path} has no usable elevation data (no <ele> values).")
+    if bad.any():
+        print(f"  warning: {int(bad.sum())} of {len(elevs)} points in "
+              f"{path} lack elevation; interpolating across them.")
+        elevs[bad] = np.interp(cum_dist[bad], cum_dist[~bad], elevs[~bad])
+    return cum_dist, elevs
 
 
 def resample_grade_profile(cum_dist, elevs, bin_size_m):
@@ -251,39 +267,93 @@ def resample_grade_profile(cum_dist, elevs, bin_size_m):
     binned_elev = np.interp(edges, cum_dist, elevs)
     bin_dist = np.diff(edges)
     bin_dist[bin_dist == 0] = 1e-6
+    # NB: each bin's grade is the secant slope between its two edge
+    # elevations - the interior of the bin is not consulted at all. That is
+    # the correct NET grade for the bin, but it does mean barometric jitter
+    # landing exactly on an edge feeds straight through (about +/-0.15% for
+    # 0.6 m of jitter across a 0.25 mi bin, so: small but not zero).
     grades = np.diff(binned_elev) / bin_dist * 100
     return grades
 
 
-def dtw_distance(seq_a, seq_b):
-    """Simple O(n*m) DTW on 1D sequences (grade %), no external deps."""
+# Sakoe-Chiba band, as a fraction of the longer sequence. Bounds how far
+# the alignment may drift from the diagonal.
+#
+# Without a band, DTW is free to stretch a single bin to cover arbitrarily
+# many, which makes it BLIND to how physically long each grade section is:
+# a target of "1.25 mi at 8% then 2.5 mi at 2%" scores a perfect 0.000
+# against a window holding only 0.25 mi at 8%, and also against one holding
+# 3.0 mi at 8%. That defeats the whole point of binning by fixed real
+# distance. A band of 0.15 keeps local time-warping (which is what we want:
+# a climb that ramps up slightly sooner still matches) while forcing
+# section lengths to roughly correspond.
+DTW_BAND_FRAC = 0.15
+
+
+def dtw_distance(seq_a, seq_b, band_frac=DTW_BAND_FRAC):
+    """Banded DTW on 1D sequences (grade %), no external deps.
+
+    Returns the accumulated |grade| difference along the optimal warping
+    path, divided by max(n, m). That divisor is a length normalizer, not
+    the true path length (which lies between max(n,m) and n+m-1); it is
+    kept because it is stable across the window lengths we compare.
+    """
+    seq_a = np.asarray(seq_a, dtype=float)
+    seq_b = np.asarray(seq_b, dtype=float)
     n, m = len(seq_a), len(seq_b)
+    if n == 0 or m == 0:
+        return float("inf")
+    # Band must be at least |n-m| wide or no path can reach the far corner.
+    w = max(int(round(band_frac * max(n, m))), abs(n - m), 1)
     cost = np.full((n + 1, m + 1), np.inf)
-    cost[0, 0] = 0
+    cost[0, 0] = 0.0
     for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            d = abs(seq_a[i - 1] - seq_b[j - 1])
-            cost[i, j] = d + min(cost[i - 1, j], cost[i, j - 1],
-                                  cost[i - 1, j - 1])
-    return cost[n, m] / max(n, m)  # normalize by path length
+        lo, hi = max(1, i - w), min(m, i + w)
+        # Vectorize the |a_i - b_j| row; the recurrence itself is sequential
+        # because cost[i, j] depends on cost[i, j-1].
+        drow = np.abs(seq_b[lo - 1:hi] - seq_a[i - 1])
+        prev = cost[i - 1]
+        cur = cost[i]
+        left = np.inf
+        for k, j in enumerate(range(lo, hi + 1)):
+            best = prev[j] if prev[j] < prev[j - 1] else prev[j - 1]
+            if left < best:
+                best = left
+            left = drow[k] + best
+            cur[j] = left
+    return float(cost[n, m] / max(n, m))
 
 
 # --------------------------------------------------------------------------
 # Strava API
 # --------------------------------------------------------------------------
 
+def _norm_lon(lon):
+    """Wrap a longitude into [-180, 180)."""
+    return ((lon + 180.0) % 360.0) - 180.0
+
+
 def km_to_deg_lat(km):
     return km / 111.0
 
 
 def km_to_deg_lon(km, at_lat):
-    return km / (111.0 * math.cos(math.radians(at_lat)))
+    # cos() collapses at the poles: at lat 90 this returns ~6e14 degrees,
+    # silently producing one absurd tile rather than raising. Clamp to
+    # roughly 85 degrees, past which longitude tiling is meaningless anyway.
+    cos_lat = math.cos(math.radians(max(-85.0, min(85.0, at_lat))))
+    return km / (111.0 * cos_lat)
 
 
 def explore_segments(token, lat, lon, radius_km, box_km=4.0):
-    """Grid-search segments/explore over a square region of radius_km,
-    using overlapping box_km x box_km tiles (explore only returns ~10
-    segments per call, so smaller tiles cover more ground).
+    """Grid-search segments/explore over a square region of half-width
+    radius_km, using adjacent (NOT overlapping - the step equals the box
+    size) box_km x box_km tiles. explore only returns ~10 segments per
+    call, so smaller tiles cover more ground.
+
+    Note that segments straddling a tile boundary can be missed entirely:
+    explore returns segments intersecting the box, but caps at ~10, so a
+    dense tile silently truncates.
 
     Each tile's result is cached to disk keyed by its bounding box, so
     overlapping search areas across runs reuse already-fetched tiles and
@@ -307,6 +377,7 @@ def explore_segments(token, lat, lon, radius_km, box_km=4.0):
 
     call_count = 0
     cache_hits = 0
+    skipped_tiles = 0
     for i, la in enumerate(lat_steps):
         for lo in lon_steps:
             sw_lat, sw_lon = la, lo
@@ -323,25 +394,53 @@ def explore_segments(token, lat, lon, radius_km, box_km=4.0):
                         results.append(seg)
                 continue
 
-            bounds = f"{sw_lat},{sw_lon},{ne_lat},{ne_lon}"
-            try:
-                resp = requests.get(
-                    f"{STRAVA_API}/segments/explore",
-                    headers=headers,
-                    params={"bounds": bounds, "activity_type": "running"},
-                    timeout=30,
-                )
-            except requests.RequestException as e:
-                print(f"  tile skipped (network error: {e})")
+            # Longitudes must stay in [-180, 180]; a search centred near
+            # the antimeridian otherwise sends bounds like "180.10" that
+            # Strava rejects.
+            sw_lon_n, ne_lon_n = _norm_lon(sw_lon), _norm_lon(ne_lon)
+            if ne_lon_n <= sw_lon_n:
+                skipped_tiles += 1  # tile wraps the dateline; not splittable
+                continue
+            bounds = f"{sw_lat},{sw_lon_n},{ne_lat},{ne_lon_n}"
+
+            # Retry a rate-limited tile instead of abandoning it. The old
+            # code slept 60s and then continued to the NEXT tile, so every
+            # tile that landed inside a 429 window was lost for the whole
+            # run - and never cached, so nothing in the output revealed the
+            # hole in the search area.
+            data = None
+            for attempt in range(3):
+                try:
+                    resp = requests.get(
+                        f"{STRAVA_API}/segments/explore",
+                        headers=headers,
+                        params={"bounds": bounds,
+                                "activity_type": "running"},
+                        timeout=30,
+                    )
+                except requests.RequestException as e:
+                    print(f"  tile skipped (network error: {e})")
+                    break
+                call_count += 1
+                if resp.status_code == 429:
+                    wait = 60 * (attempt + 1)
+                    print(f"  Rate limited by Strava. Waiting {wait}s "
+                          f"(tile retry {attempt + 1}/3)...")
+                    time.sleep(wait)
+                    continue
+                if resp.status_code in (401, 403):
+                    sys.exit(f"Strava rejected the request (HTTP "
+                             f"{resp.status_code}) - your token may have "
+                             f"expired or lack scope. Re-run --authorize.")
+                if resp.status_code != 200:
+                    print(f"  tile skipped (HTTP {resp.status_code})")
+                    break
+                data = resp.json()
+                break
+            if data is None:
+                skipped_tiles += 1
                 continue
 
-            call_count += 1
-            if resp.status_code == 429:
-                print("  Rate limited by Strava. Waiting 60s...")
-                time.sleep(60)
-                continue
-            resp.raise_for_status()
-            data = resp.json()
             tile_segs = data.get("segments", [])
             _cache_write(cache_path, tile_segs)
             for seg in tile_segs:
@@ -357,6 +456,12 @@ def explore_segments(token, lat, lon, radius_km, box_km=4.0):
 
     print(f"Found {len(results)} unique candidate segments "
           f"({call_count} API calls, {cache_hits} tiles from cache).")
+    if skipped_tiles:
+        # Surfaced because an unreported hole in the grid looks exactly
+        # like "there are no good segments over there".
+        print(f"  WARNING: {skipped_tiles} of {total} tiles could not be "
+              f"fetched - those areas were NOT searched. Re-run to fill "
+              f"them in (cached tiles cost no API calls).")
     return results
 
 
@@ -389,21 +494,34 @@ def get_segment_stream(token, segment_id):
             headers=headers, params=params, timeout=30,
         )
     if resp.status_code != 200:
-        return None  # don't cache transient failures
+        # Not cached - a transient failure must not become a permanent
+        # "_miss". But it must also not be silent: a 429 here previously
+        # made the candidate indistinguishable from one with no stream, so
+        # rate-limiting could quietly drop the best match from the results.
+        print(f"  warning: stream fetch for segment {segment_id} failed "
+              f"(HTTP {resp.status_code}) - candidate NOT scored.")
+        return None
     data = resp.json()
     if "distance" not in data or "altitude" not in data:
         _cache_write(cache_path, {"_miss": True})  # cache the genuine miss
         return None
 
-    latlng_data = data["latlng"]["data"] if "latlng" in data else None
+    try:
+        dist_data = data["distance"]["data"]
+        alt_data = data["altitude"]["data"]
+    except (KeyError, TypeError):
+        # Malformed payload (key present but not the expected shape).
+        _cache_write(cache_path, {"_miss": True})
+        return None
+    latlng_data = (data.get("latlng") or {}).get("data")
     _cache_write(cache_path, {
-        "distance": data["distance"]["data"],
-        "altitude": data["altitude"]["data"],
+        "distance": dist_data,
+        "altitude": alt_data,
         "latlng": latlng_data,
     })
     latlng = np.array(latlng_data) if latlng_data else None
-    return (np.array(data["distance"]["data"]),
-            np.array(data["altitude"]["data"]),
+    return (np.array(dist_data, dtype=float),
+            np.array(alt_data, dtype=float),
             latlng)
 
 
@@ -497,11 +615,57 @@ def export_segment_gpx(token, segment_id, out_path, reverse=False,
 # --------------------------------------------------------------------------
 
 def total_gain_loss(elevs):
-    """Total ascent and descent (meters) from an elevation array."""
-    diffs = np.diff(elevs)
+    """Total ascent and descent (meters) from an elevation array.
+
+    NOTE: this is sampling-density dependent - the same hill recorded at
+    1 m spacing reports several times the gain it does at 25 m spacing,
+    because every scrap of barometric jitter is counted as real climbing.
+    Use vertical_change() for anything that compares two profiles; this
+    remains only for callers that already hold a uniformly-sampled array.
+    """
+    diffs = np.diff(np.asarray(elevs, dtype=float))
+    diffs = diffs[np.isfinite(diffs)]
     gain = np.sum(diffs[diffs > 0])
     loss = -np.sum(diffs[diffs < 0])
-    return gain, loss
+    return float(gain), float(loss)
+
+
+# Elevation is re-sampled to this fixed spatial interval before ascent and
+# descent are accumulated. Gain is otherwise not a well-defined property of
+# terrain: it grows without bound as sampling gets denser, because GPS/
+# barometric jitter accumulates. Fixing the interval makes the number a
+# property of the HILL rather than of the recording device, and - critically
+# - makes the target's gain and a candidate window's gain measured the same
+# way, so their ratio means something.
+VERT_RESAMPLE_M = 25.0
+
+
+def vertical_change(cum_dist, elevs, resample_m=VERT_RESAMPLE_M):
+    """Total ascent/descent (m) measured at a fixed spatial interval.
+
+    Returns (gain, loss) as positive magnitudes."""
+    cum_dist = np.asarray(cum_dist, dtype=float)
+    elevs = np.asarray(elevs, dtype=float)
+    if cum_dist.size < 2:
+        return 0.0, 0.0
+    span = float(cum_dist[-1] - cum_dist[0])
+    if span <= 0:
+        return 0.0, 0.0
+    # Interpolate ACROSS non-finite elevations rather than letting them
+    # propagate. Dropping non-finite diffs afterwards is not enough: a
+    # single NaN poisons both adjacent diffs, and an all-NaN profile then
+    # returns a perfectly quiet 0.0 that makes the gain term inert.
+    good = np.isfinite(elevs)
+    if not good.any():
+        return 0.0, 0.0
+    if not good.all():
+        elevs = np.interp(cum_dist, cum_dist[good], elevs[good])
+    n = max(2, int(round(span / resample_m)) + 1)
+    grid = np.linspace(cum_dist[0], cum_dist[-1], n)
+    e = np.interp(grid, cum_dist, elevs)
+    d = np.diff(e)
+    d = d[np.isfinite(d)]
+    return float(d[d > 0].sum()), float(-d[d < 0].sum())
 
 
 def wasserstein_1d(a, b, n=100):
@@ -518,10 +682,21 @@ def wasserstein_1d(a, b, n=100):
     """
     a = np.sort(np.asarray(a, dtype=float))
     b = np.sort(np.asarray(b, dtype=float))
-    qs = np.linspace(0, 1, n)
-    qa = np.interp(qs, np.linspace(0, 1, len(a)), a)
-    qb = np.interp(qs, np.linspace(0, 1, len(b)), b)
-    return float(np.mean(np.abs(qa - qb)))
+    if a.size == 0 or b.size == 0:
+        return float("inf")
+    # Exact W1 = integral of |F_a(x) - F_b(x)| dx, evaluated on the merged
+    # support. The previous quantile-grid approximation mapped each sample
+    # set onto plotting positions k/(n-1), which squeezes both empirical
+    # CDFs inward and biases the result - by ~10% on small bin counts, and
+    # by a DIFFERENT amount for each window length, since window bin counts
+    # vary with the length being tried.
+    allv = np.concatenate([a, b])
+    allv.sort()
+    if allv.size < 2:
+        return 0.0
+    cdf_a = np.searchsorted(a, allv[:-1], side="right") / a.size
+    cdf_b = np.searchsorted(b, allv[:-1], side="right") / b.size
+    return float(np.sum(np.abs(cdf_a - cdf_b) * np.diff(allv)))
 
 
 # Signed grade bands (%) for the human-readable composition breakdown.
@@ -638,6 +813,11 @@ _OVERPASS_HEADERS = {
 _OVERPASS_UNREACHABLE = False  # set True after a totally failed probe,
                                 # so we stop hammering unreachable hosts
                                 # for every remaining candidate
+
+# Memoizes road lookups by rounded (lat, lon) so repeated probes of nearby
+# window starts cost nothing. Values are metres, or None for "checked, no
+# road found".
+_ROAD_DIST_CACHE = {}
 
 
 def road_distance_m_overpass(lat, lon, radii=(300, 1000, 2500), debug=False):
@@ -822,27 +1002,64 @@ def find_best_window(seg_dist, seg_elev, seg_latlng, target_grade_seq,
     # magnitude (its loss) is what should match it.
     best = None
 
-    for length_frac in np.linspace(min_frac, max_frac, length_steps):
-        win_len = target_dist_m * length_frac
-        if win_len > total_len:
-            continue
+    length_fracs = np.linspace(min_frac, max_frac, length_steps)
+    # np.linspace(0.75, 1.15, 7) yields 0.75, 0.817, 0.883, 0.95, 1.017,
+    # 1.083, 1.15 - it never lands on 1.0. The single most likely correct
+    # window length was the one length the search never tried.
+    if min_frac <= 1.0 <= max_frac:
+        length_fracs = np.unique(np.append(length_fracs, 1.0))
+
+    # Clamp each trial length to the segment, then de-duplicate. Skipping
+    # over-long windows outright meant a segment even a few METRES shorter
+    # than the target could never be tried at its natural length: the 1.0x
+    # window was dropped and the best remaining length was 0.95x, whose bins
+    # span a different physical distance than the target's. Measured on a
+    # self-match, that turned a 0.166 score into 2.164.
+    win_lens = np.unique(np.minimum(target_dist_m * length_fracs, total_len))
+
+    for win_len in win_lens:
+        win_len = float(win_len)
         step = max(target_dist_m * start_step_frac, 10)
         starts = np.arange(0, total_len - win_len + 1e-9, step)
         if len(starts) == 0:
             starts = np.array([0.0])
+        # Ensure the final window reaches the segment's end; otherwise the
+        # last (up to one step) of every segment is never searched.
+        if starts[-1] < total_len - win_len - 1e-9:
+            starts = np.append(starts, total_len - win_len)
+
+        n_bins = max(2, int(round(win_len / bin_size_m)))
 
         for start in starts:
             end = start + win_len
-            interp_n = max(len(target_grade_seq) * 4, 100)
-            sub_d = np.linspace(start, end, interp_n)
-            sub_elev = np.interp(sub_d, seg_dist, seg_elev)
-            fwd_grade_seq = resample_grade_profile(sub_d - start, sub_elev,
-                                                     bin_size_m)
-            if fwd_grade_seq is None:
-                continue
+            # Interpolate the bin EDGES straight off the real stream.
+            # The previous code built a 100-point intermediate grid and
+            # re-interpolated the edges out of that; since
+            # resample_grade_profile only ever reads edge elevations, the
+            # intermediate grid discarded stream detail for no benefit and
+            # made the result depend on the target's bin count.
+            edges = np.linspace(start, end, n_bins + 1)
+            edge_elev = np.interp(edges, seg_dist, seg_elev)
+            widths = np.diff(edges)
+            widths[widths == 0] = 1e-6
+            fwd_grade_seq = np.diff(edge_elev) / widths * 100.0
             rev_grade_seq = -np.flip(fwd_grade_seq)
 
-            raw_gain_m, raw_loss_m = total_gain_loss(sub_elev)
+            # Gain/loss from the real stream samples inside the window, at
+            # the same fixed spatial interval used for the target, so the
+            # two numbers are measured the same way and their ratio means
+            # something. Previously the target's gain came from the raw GPX
+            # (often 1-4 m spacing, jitter inflating it several-fold) while
+            # the window's came from a ~60-100 m decimated grid - a perfect
+            # self-match scored gain_dev = 50%.
+            lo_i = np.searchsorted(seg_dist, start, side="left")
+            hi_i = np.searchsorted(seg_dist, end, side="right")
+            w_d = np.concatenate(([start], seg_dist[lo_i:hi_i], [end]))
+            w_e = np.concatenate((
+                [np.interp(start, seg_dist, seg_elev)],
+                seg_elev[lo_i:hi_i],
+                [np.interp(end, seg_dist, seg_elev)]))
+            raw_gain_m, raw_loss_m = vertical_change(w_d, w_e)
 
             # "forward" = run the window as-recorded; "reverse" = run it
             # backward (gain/loss swap). Reversible tries both and keeps
@@ -1063,7 +1280,7 @@ def main():
     cum_dist, elevs = load_gpx_profile(args.gpx)
     target_dist_m = cum_dist[-1]
     target_dist_mi = target_dist_m / 1609.34
-    target_gain_m, target_loss_m = total_gain_loss(elevs)
+    target_gain_m, target_loss_m = vertical_change(cum_dist, elevs)
     target_gain_ft = target_gain_m * 3.28084
     bin_size_m = args.grade_bin_mi * 1609.34
     target_grade_seq = resample_grade_profile(cum_dist, elevs, bin_size_m)
