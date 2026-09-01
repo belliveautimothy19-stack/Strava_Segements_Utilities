@@ -489,3 +489,127 @@ it is recorded rather than taken silently.
   has to average at least 2 percent grade to count as a phase.
 
 Both have regression tests.
+
+## Audit 6: the 6 km use case
+
+The tool is used on segments of about 6 km. Every experiment up to this
+point cut 1 km windows, so the length that matters had never been
+measured. Two questions were separated because they have different
+answers:
+
+- **Shape recovery.** The same ground, re-measured. A property of the
+  matcher alone; no corpus involved.
+- **Archetype similarity.** Different ground of the same kind. A
+  retrieval question, so the answer depends on what else is in the
+  corpus.
+
+### Shape recovery improves with length
+
+Median self-match error, six real routes:
+
+| window | decimation | localization | combined |
+|--------|-----------|--------------|----------|
+| 600 m  | 0.740 | 0.333 | 1.089 |
+| 1000 m | 1.130 | 0.222 | 0.996 |
+| 3000 m | 0.916 | 0.161 | 0.882 |
+| 6000 m | 0.743 | 0.153 | 0.841 |
+
+Length is not the risk it was assumed to be. The score is a mean over the
+warped path, so per-cell sampling error averages down as the path grows.
+
+### The earlier length effect was sampling rate
+
+Decimation error at a fixed 1 km window tracks a route's native GPS
+spacing and nothing else:
+
+| native spacing | 6.0 m | 13.5 m | 16.4 m | 25.0 m | 30.0 m | 33.4 m |
+|----------------|-------|--------|--------|--------|--------|--------|
+| decimation err | 0.599 | 0.842  | 0.539  | 1.221  | 1.255  | 1.078  |
+
+Window length was confounded with which routes are long enough to supply
+one. Holding the route fixed, error falls monotonically with length:
+1.268 at 1 km to 0.799 at 8 km on 19670306718.
+
+### Archetype similarity does not collapse; the pooled metric did
+
+The previous audit concluded archetype similarity was "nearly gone by
+2.2 km". That was wrong, and the error was in the metric. Category B
+pools two populations:
+
+| window | B_strict AUC | n | B_loose AUC | n | pooled |
+|--------|-------------|---|-------------|---|--------|
+| 1000 m | 0.839 [0.816, 0.861] | 600 | 0.632 [0.600, 0.660] | 600 | 0.735 |
+| 2200 m | 0.751 [0.721, 0.780] | 408 | 0.450 [0.418, 0.482] | 546 | 0.579 |
+| 3000 m | 0.777 [0.745, 0.809] | 183 | 0.414 [0.372, 0.457] | 233 | 0.574 |
+| 4000 m | 0.833 [0.796, 0.867] | 114 | 0.406 [0.344, 0.473] |  58 | 0.689 |
+
+B_strict requires comparable steepness; B_loose does not. B_strict is
+flat inside its intervals across the whole range. B_loose falls below
+chance, which is the matcher declining to call a 3 percent and a 9
+percent climb the same hill; the phase signature is deliberately blind to
+magnitude and the matcher is not. The pooled number tracked only the
+shifting ratio between the two populations. It is still computed, under a
+name that says not to read it.
+
+Physical identity over the same range: AUC 0.914, 0.919, 0.929, 0.944,
+0.986 at 1000 through 6000 m.
+
+### Resolution stays at 70 m
+
+Real data cannot decide this question, and saying so matters more than
+the numbers. On the 6 km corpus every resolution from 50 to 150 m gives
+AUC(A|D) between 0.984 and 0.986. On the densely sampled sub-corpus the
+interval on AUC(A|D) spans 0.10 with 13 positives, which swallows any
+difference. The reason is Nyquist: the only two routes long enough to
+supply 6 km windows are sampled every 30 and 33 m, so they resolve
+nothing below 75 to 84 m and carry 0.9 and 0.1 percent of their grade
+variance below 100 m. There is no fine structure in them to lose.
+
+Real terrain does have that structure. A route sampled every 6 m carries
+36 percent of its grade variance below 100 m and 25 percent below 50 m.
+
+The synthetic probe is the only instrument that can see the difference,
+and it is emphatic. A staircase and a ramp of identical length, gain and
+loss, differing only in ordered shape below the pitch:
+
+| pitch | res 50 | res 70 | res 90 | res 120 | res 150 |
+|-------|--------|--------|--------|---------|---------|
+|  60 m | 5.22 | 4.10 | 2.97 | 1.40 | 0.20 |
+| 120 m | 6.63 | 6.06 | 5.54 | 4.78 | 3.88 |
+| 240 m | 7.37 | 7.09 | 6.84 | 6.47 | 6.05 |
+
+Measured at 6 km; the 1 km and 3 km tables are the same to two decimals,
+so length does not rescue under-resolution. Structure below the grid is
+destroyed, not averaged.
+
+**Recommendation: keep 70 m.** Moving to 120 m costs two thirds of the
+discrimination on 60 m pitch structure and buys only a lower
+self-consistency error, which is itself a symptom of seeing less. A
+matcher blind to fine structure has nothing to disagree with itself
+about. 70 m also sits just under the 75 to 84 m Nyquist limit of a
+typical 30 m-sampled Strava stream, so it wastes nothing on those.
+
+### Provenance of the long-window evidence
+
+19476565994 now carries GPS. It covers the same ground as 19670306718 at
+99.6 percent overlap and 8.5 m median separation, so it is a second
+recording of one trail, not a second trail. 61 of the 81 category A pairs
+at 6 km are now cross-recording, which is stronger than the single-file
+retrace it replaces because the two recordings carry independent
+barometer drift and independent GPS noise. It does not widen the
+geographic evidence. Every report prints its A provenance.
+
+### Four defects found in the instruments
+
+- The bounding-box prefilter derived its longitude scale per window, so
+  every window sat in a different frame. The bound was violated on 7708
+  of 8534 pairs. Now one fixed projection origin, verified to zero.
+- The report thresholded at the median of the positives and reported the
+  false negative rate against it, which is 0.5 by construction. It read
+  as a flat 0.494 across every window length.
+- AUC was reported without an interval, on samples as small as 12.
+- Category B was pooled across two populations whose ratio moves with the
+  variable under study.
+
+All four have regression tests. Three of the four would have reported a
+clean result while measuring nothing.

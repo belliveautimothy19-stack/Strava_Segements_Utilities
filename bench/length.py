@@ -86,10 +86,21 @@ def auc_ci(pos, neg, n_boot=2000, seed=0):
 
 
 def _bucket(scored):
+    """Group scores by category, keeping the two B variants apart.
+
+    They used to be pooled into a single B. That number fell from 0.735
+    at 1 km to 0.574 at 3 km and read as the matcher losing its grip on
+    terrain similarity at long range. It was an artifact of the pooling:
+    B_strict is flat at 0.75 to 0.84 across the same range and B_loose
+    sits at 0.41 to 0.63, so the pooled value tracks nothing but the
+    shifting ratio between them. A pooled "B" is still reported for
+    continuity with the earlier runs and is marked as uninterpretable.
+    """
     b = {}
     for r in scored:
-        c = r["cat"]
-        b.setdefault("B" if c.startswith("B") else c, []).append(r["score"])
+        b.setdefault(r["cat"], []).append(r["score"])
+        if r["cat"].startswith("B"):
+            b.setdefault("B_pooled_do_not_interpret", []).append(r["score"])
     return b
 
 
@@ -163,7 +174,9 @@ def length_report(win_m, res_m=70.0, stride_m=None, cap=None,
     pairs = _subsample(categorize(w), max_per_cat, seed)
     scored = score_pairs(pairs, res_m, cap=cap)
     b = _bucket(scored)
-    a, bb, d = b.get("A", []), b.get("B", []), b.get("D", [])
+    a, d = b.get("A", []), b.get("D", [])
+    b_strict, b_loose = b.get("B_strict", []), b.get("B_loose", [])
+    bb = b.get("B_pooled_do_not_interpret", [])
     # A pairs drawn from one recording are a retrace within a single
     # file: they share a barometer calibration and one GPS fix. A pairs
     # drawn from two recordings of the same ground share neither. They
@@ -179,8 +192,13 @@ def length_report(win_m, res_m=70.0, stride_m=None, cap=None,
         "n_windows": len(w), "n_routes": len({x["route"] for x in w}),
         "counts": {k: len(v) for k, v in b.items()},
         "n_A_same_recording": len(a_same), "n_A_cross_recording": len(a_cross),
-        "auc_AD": auc(a, d), "auc_BD": auc(bb, d),
-        "auc_AD_ci": auc_ci(a, d), "auc_BD_ci": auc_ci(bb, d),
+        "auc_AD": auc(a, d), "auc_AD_ci": auc_ci(a, d),
+        "auc_BstrictD": auc(b_strict, d),
+        "auc_BstrictD_ci": auc_ci(b_strict, d),
+        "auc_BlooseD": auc(b_loose, d),
+        "auc_BlooseD_ci": auc_ci(b_loose, d),
+        "n_B_strict": len(b_strict), "n_B_loose": len(b_loose),
+        "auc_BD_pooled_do_not_interpret": auc(bb, d),
         "auc_AD_cross_only": auc(a_cross, d),
         "median": {k: float(np.median(v)) for k, v in b.items() if v},
         "prov_A": provenance(scored, "A"),

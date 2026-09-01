@@ -163,3 +163,39 @@ def test_shape_recovery_does_not_degrade_with_length():
     assert long["n"] > 0 and short["n"] > 0
     assert long["localization"] <= short["localization"] * 1.5
     assert long["combined"] <= short["combined"] * 1.2
+
+
+def test_pooled_B_is_not_reported_as_an_interpretable_number():
+    """B_strict and B_loose must stay separate.
+
+    Pooled, they produced an AUC that fell from 0.735 at 1 km to 0.574 at
+    3 km and read as the matcher losing terrain similarity at long range.
+    B_strict is flat at 0.75 to 0.84 over that range and B_loose sits at
+    0.41 to 0.63, so the pooled value tracked only the shifting ratio
+    between two populations, not anything about the matcher.
+    """
+    from bench.length import _bucket
+    scored = ([{"cat": "B_strict", "score": 1.0}] * 3
+              + [{"cat": "B_loose", "score": 9.0}] * 3
+              + [{"cat": "D", "score": 5.0}])
+    b = _bucket(scored)
+    assert b["B_strict"] == [1.0, 1.0, 1.0]
+    assert b["B_loose"] == [9.0, 9.0, 9.0]
+    assert "B" not in b
+    assert len(b["B_pooled_do_not_interpret"]) == 6
+
+
+def test_matcher_separates_same_shape_at_different_steepness():
+    """Two climbs with the same phase signature and very different
+    steepness must NOT score as similar. B_loose sits below chance
+    against unrelated terrain, which is the matcher declining to call a
+    3 percent and a 9 percent climb the same hill. That is deliberate,
+    so it is pinned rather than left to drift.
+    """
+    cfg = MatchConfig()
+    d, e = uniform_climb(3000.0, grade=0.03)
+    d2, e2 = uniform_climb(3000.0, grade=0.09)
+    same = match_segment(d, e, prepare_target(d, e, cfg), cfg)[0].score
+    diff = match_segment(d2, e2, prepare_target(d, e, cfg), cfg)[0].score
+    assert same < 0.05
+    assert diff > 2.0, diff
