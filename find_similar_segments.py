@@ -2,17 +2,25 @@
 """
 find_similar_segments.py
 
-Finds Strava running segments near a given location whose elevation and
-grade profile most closely matches a target GPX file. Not just a similar
-average grade or distance, but a similar ordered shape: punchy start,
-rolling middle, steep pinch, flat finish.
+Finds Strava running segments near a given location whose CLIMBING
+DEMAND most closely matches a target GPX file: similar ordered profile
+AND similar steepness and vertical, at comparable length.
+
+Both halves of that matter, and the magnitude half matters more. Measured
+rank correlation of the score against axes defined outside the matcher,
+over 1500 real pairs: steepness difference 0.55, magnitude-preserving
+shape 0.47, ordered shape with steepness normalized away 0.13. A 3
+percent and a 9 percent climb of identical profile shape are NOT reported
+as similar, and that is deliberate. An earlier version of this text
+described the tool as matching ordered shape rather than average grade,
+which inverted the true emphasis.
 
 HOW A MATCH IS DECIDED
 ----------------------
 Both the target and every candidate are converted to a normalized
 representation first: elevation resampled onto a uniform arc-length grid,
 and grade estimated as a least squares slope over a fixed physical scale
-(--grade-res-m, default 120 m). That step is what makes a target recorded
+(--grade-res-m, default 70 m). That step is what makes a target recorded
 at 1 m GPS spacing comparable to a Strava stream at 10 m spacing.
 
 Windows of varying length and offset are then generated across each

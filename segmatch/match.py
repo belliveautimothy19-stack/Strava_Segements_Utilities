@@ -163,11 +163,19 @@ class MatchConfig:
     labelled synthetic dataset. See PARAMETERS.md for the measurements
     behind each one. In summary:
 
-      res_m 120        grade resolution. Swept from 25 m to 600 m; F1
-                       peaks on a 90 to 120 m plateau (0.955) against
-                       0.903 at the old 0.25 mi / 402 m value, driven by
-                       false positives roughly halving. 120 is the
-                       coarsest value on that plateau.
+      res_m 70         grade resolution. The synthetic sweep put F1 on a
+                       90 to 120 m plateau and this docstring said 120
+                       for three audits after the default had moved to
+                       70, which is the same hazard as a fraction read as
+                       a percent: the authoritative prose and the real
+                       value disagreed. 70 is the finest resolution that
+                       is defensible under current data and physics, not
+                       an empirical optimum. See PARAMETERS.md; briefly,
+                       discrimination of a gain-matched 60 m staircase
+                       from a ramp falls 4.10 at 70 m to 1.40 at 120 m
+                       and 0.20 at 150 m, and real streams long enough to
+                       test 6 km windows are sampled at 30 m and cannot
+                       resolve the difference either way.
       max_shift_frac   0.03. Tighter alignment tolerance was both more
                        accurate and faster than 0.05, 0.10 or 0.18.
       dist_bin_w 0     no binning. Histogram bin widths from 0.25 to 4.0

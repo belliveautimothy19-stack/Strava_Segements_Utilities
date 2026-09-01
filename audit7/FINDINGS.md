@@ -181,3 +181,154 @@ agreement is close to a precondition; given it, ordered shape refines the
 ranking. Whether that is the right product behavior is a product
 question, and the current answer is defensible: most runners would not
 call a 3 percent and a 9 percent climb the same hill.
+
+---
+
+# Closure pass (post-audit-7)
+
+Production behavior unchanged. Two documentation defects were corrected
+and are covered by tests; the diff touches only docstrings, and the
+frozen-defaults test plus a golden score confirm behavior is identical.
+
+## The audit-7 data requirement was wrong
+
+Audit 7 proposed "three trails, >= 8 km, recorded twice". Checked against
+measurement rather than asserted:
+
+**8 km is far too short.** Truncating the one trail that can supply 6 km
+windows and counting the category A pairs its two recordings yield:
+
+    route length     8 km  10 km  12 km  15 km  18 km  21 km  24 km
+    A pairs at 6 km     4      7     10     16     28     45     59
+
+An 8 km route gives **four** pairs, not the thirty the plan assumed.
+
+**Three trails is too few.** Between-trail AUC standard deviation is at
+least 0.038. With a t interval that gives a 95 percent half-width on the
+across-trail mean of 0.095 at 3 trails, 0.061 at 4, and 0.048 at 5.
+
+**And 0.038 is a lower bound, not an estimate.** Only one distinct trail
+supplies enough category A pairs at any length, so most of that spread is
+within-trail variation between recording pairings. True between-trail
+variance is unmeasured and is very likely larger. The requirement should
+be re-derived once it can be estimated.
+
+**Pairs within one trail are pseudo-replicates.** 59 pairs from one trail
+are not 59 independent observations; the effective count is nearer the
+number of non-overlapping window positions. Every bootstrap interval in
+audits 4 to 7 treats pairs as independent and is therefore too narrow.
+Cluster over trails.
+
+**Consequence for design.** Trail count dominates pair count. Five trails
+of 12 km beat one trail of 60 km, despite yielding fewer pairs.
+
+## The paired test settles resolution on real data
+
+Comparing independent confidence intervals across resolutions was
+underpowered. The same pairs scored at every resolution is a paired
+comparison, and between-pair variance cancels:
+
+    res    mean retrieval percentile    delta vs 70 m    t
+     50            0.8884                 -0.00326     -6.6
+     70            0.8917                  0           --
+     90            0.8928                 +0.00114     +2.7
+    120            0.8938                 +0.00218     +2.9
+    150            0.8974                 +0.00570     +5.1
+
+On 745 real positives, coarser resolution is **statistically better and
+practically negligible**: 150 m beats 70 m by 0.6 percentage points of
+retrieval percentile. Against that, the synthetic probe shows 70 m
+separating a gain-matched 60 m staircase from a ramp by 4.10 where 150 m
+manages 0.20, a twentyfold difference at a scale the real streams cannot
+record. The t values are inflated by pseudo-replication; the effect size
+is the number that matters.
+
+The earlier claim that real data "cannot decide" is superseded. It can,
+with a paired test, and the answer is that the difference is real and
+tiny.
+
+## The alignment band, in physical units
+
+`band_samples = max(1, round(0.03 * n_cmp))` and `n_cmp = length /
+(res_m / 2)`, so the band in metres is `max(res_m / 2, 0.03 * length)`.
+It is not 3 percent at every length:
+
+    length     n_cmp   band samples   band metres   effective fraction
+      400 m       11              1          36.4        9.09%
+      600 m       17              1          35.3        5.88%
+     1000 m       29              1          34.5        3.45%
+     3000 m       86              3         104.7        3.49%
+     6000 m      171              5         175.4        2.92%
+
+Below about 1170 m the band is one comparison sample, that is `res_m / 2`,
+not a fraction of length at all.
+
+**Is a fractional band physically right?** Measured directly. Matching
+353 GPS fixes between the two recordings of the same trail, on their
+outbound legs where the correspondence is monotone (verified 100 percent
+monotone), and removing the constant 219 m start offset, which the offset
+grid search absorbs rather than DTW:
+
+    window    p50 within-window drift   p90     band at res 70   covered
+      600 m            32.1 m          40.6 m        35.3 m        no
+     1000 m            40.9            52.4          34.5          no
+     1500 m            54.4            64.6          34.9          no
+     2200 m            68.0            80.2          69.8          no
+     3000 m            88.6           104.6         104.7          yes
+     4000 m           114.7           135.2         105.3          no
+     6000 m           170.8           189.9         175.4          no
+
+Drift **scales with window length**, at p90 roughly 3.2 to 3.6 percent
+for windows of 2.2 km and above. So the fractional parameterization is
+physically correct, and the constant 0.03 sits just below the drift it
+must absorb. That is a principled explanation for why the empirical sweep
+favours a wider band, and it also bounds how wide: cover the measured
+drift, around 0.04 to 0.05, rather than the 0.30 that the raw AUC sweep
+would suggest, because beyond the physical drift a wider band only lets
+unrelated terrain align. The nearest negative falls from 1.920 to 1.438
+across that sweep.
+
+Not changed. One trail pair, 5 windows at 6 km, is not enough to move a
+production default on.
+
+## Long-window scoring architecture
+
+Reviewed analytically, then spot-checked.
+
+`dtw_band` divides accumulated cost by `max(len(a), len(b))`, so the
+shape term is a **mean per sample**. An identical relative perturbation
+gives score 0.292 at 1 km and 0.202 at 6 km: no length-dependent drift.
+
+A true local anomaly, up and back down so the profile returns to
+baseline, injected into a 6 km window:
+
+    bump width   200 m   500 m   1000 m   2000 m   3000 m
+    score        1.474   1.556    1.369    1.069    1.071
+
+The penalty does not fall in proportion to the length fraction, and peaks
+near 8 percent of the window. A narrow bump is steep and brief; a wide
+one is gentle and sustained, and under an L1 mean those partly cancel.
+
+**One 500 m feature does dominate a diffuse difference**: 1.556 against
+0.193 for a candidate differing mildly everywhere. The matcher has no
+notion of "mostly the same with one exception". For an objective defined
+as climbing demand this is defensible, since a 25 m bump is real demand
+and a diffuse wobble is measurement noise, but it is a design property
+that should be stated rather than discovered.
+
+One boundary, not reachable at 6 km: `n_cmp` caps at 512, so above
+17,920 m at res 70 the shape comparison samples coarser than `res_m / 2`
+and silently under-resolves the profile it was built from.
+
+## Does archetype instability block GREEN?
+
+**No.** The archetype classifier is an audit instrument only. It appears
+nowhere in `segmatch/`, nowhere in the scoring function, and nowhere in
+the CLI. It exists to label category B, which tests a *semantic* claim
+the production objective does not make: the objective is comparable
+climbing demand, not "same kind of hill" independent of magnitude.
+
+Criterion 7 of the audit-7 GREEN list is therefore **withdrawn as a
+GREEN blocker** and retained as a precondition on archetype claims only.
+Collecting data to stabilize it would be solving a problem the product
+does not have.

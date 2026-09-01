@@ -288,3 +288,129 @@ def test_shape_and_dist_are_distinct_terms_in_general():
     cfg = MatchConfig()
     m = match_segment(d, b, prepare_target(d, a, cfg), cfg)[0]
     assert abs(m.shape - m.dist) > 1e-6
+
+
+# ------------------------------------------------ documentation truth
+
+def test_documented_resolution_matches_the_real_default():
+    """The class docstring said res_m 120 for three audits after the
+    default moved to 70. Prose and value disagreeing is the same hazard
+    as a fraction read as a percent, and it is user-facing: the CLI
+    passes its module docstring to --help.
+    """
+    import segmatch.match as M
+    import find_similar_segments as F
+    default = MatchConfig().res_m
+    assert "res_m %d" % default in M.MatchConfig.__doc__
+    assert "default %d m" % default in F.__doc__
+    for stale in ("res_m 120", "default 120 m"):
+        assert stale not in M.MatchConfig.__doc__
+        assert stale not in (F.__doc__ or "")
+
+
+def test_cli_help_does_not_claim_shape_over_magnitude():
+    """Measured rank correlation is 0.55 against steepness difference and
+    0.13 against steepness-blind ordered shape. Text promising the
+    opposite emphasis misdescribes the product."""
+    import find_similar_segments as F
+    doc = F.__doc__ or ""
+    assert "CLIMBING" in doc.upper()
+    assert "Not just a similar\naverage grade or distance, but a similar ordered shape" not in doc
+
+
+# ------------------------------------------- evidence-plan arithmetic
+
+def test_eight_km_does_not_yield_thirty_pairs():
+    """Audit 7 proposed routes of >= 8 km. Checked against the measured
+    yield rather than asserted, an 8 km route recorded twice gives FOUR
+    category A pairs at a 6 km window, not thirty. The requirement was
+    wrong and is now 12 km with a floor of 10 pairs.
+    """
+    from audit7.accept import (MIN_A_PAIRS_PER_TRAIL, MIN_ROUTE_LENGTH_M,
+                               expected_A_pairs)
+    assert expected_A_pairs(8000.0) < 10
+    assert expected_A_pairs(MIN_ROUTE_LENGTH_M) >= MIN_A_PAIRS_PER_TRAIL
+    assert expected_A_pairs(5000.0) == 0
+    # monotone in length
+    ys = [expected_A_pairs(x) for x in (6000, 9000, 12000, 18000, 24000)]
+    assert ys == sorted(ys)
+
+
+def test_dense_recording_must_also_be_long_enough_to_use():
+    """A 5.2 km route sampled every 6 m cannot produce a 6 km window, so
+    it cannot help the resolution question however dense it is. The first
+    acceptance checker counted it as satisfying the dense criterion."""
+    from audit7.accept import evaluate
+    rec = {"name": "dense_but_short", "span_m": 5200.0, "spacing_m": 6.0,
+           "n_points": 900, "elev_step_m": 0.1, "relief_m": 120.0,
+           "has_gps": True, "window_positions_6km": 0,
+           "can_yield_6km_window": False, "dense": True,
+           "frac_grade_var_below_60m": 0.34,
+           "frac_grade_var_below_120m": 0.45,
+           "ll": np.column_stack([40.0 + np.arange(50) * 1e-4,
+                                  -105.3 + np.zeros(50)])}
+    rep = evaluate([rec, dict(rec, name="second")])
+    assert rep["criteria"]["dense_trails_usable_at_6km"][0] == 0
+
+
+def test_acceptance_checker_counts_trails_not_activities():
+    """Two recordings of one trail are one trail. Criterion 1 counts
+    locations; adding files to the same trail must not satisfy it."""
+    from audit7.accept import evaluate
+    ll = np.column_stack([40.0 + np.arange(60) * 1e-4, -105.3 + np.zeros(60)])
+    base = {"name": "a", "span_m": 20000.0, "spacing_m": 8.0,
+            "n_points": 2500, "elev_step_m": 0.1, "relief_m": 300.0,
+            "has_gps": True, "window_positions_6km": 10,
+            "can_yield_6km_window": True, "dense": True,
+            "frac_grade_var_below_60m": 0.3,
+            "frac_grade_var_below_120m": 0.4, "ll": ll}
+    rep = evaluate([dict(base, name="rec%d" % i) for i in range(6)])
+    assert rep["n_recordings"] == 6
+    assert rep["n_trails"] == 1
+    assert not rep["satisfied"]
+
+
+# --------------------------------------------- scoring architecture
+
+def test_score_does_not_scale_with_window_length():
+    """An identical relative perturbation must not cost more simply
+    because the window is longer. DTW is normalized by max(len(a),
+    len(b)), so the shape term is a mean per sample, not a sum."""
+    rng = np.random.default_rng(0)
+    cfg = MatchConfig()
+    scores = []
+    for L in (1000.0, 3000.0, 6000.0):
+        d = np.arange(0.0, L, 10.0)
+        base = 1500.0 + np.cumsum(rng.normal(0, 0.35, len(d)))
+        alt = base + np.cumsum(rng.normal(0, 0.05, len(d)))
+        scores.append(match_segment(d, alt, prepare_target(d, base, cfg),
+                                    cfg)[0].score)
+    assert max(scores) < 2.0 * min(scores), scores
+
+
+def test_band_is_max_of_one_sample_and_three_percent():
+    """The band is not 3 percent at every length. It floors at one
+    comparison sample, so below about 1170 m it is res_m/2 in metres and
+    the effective fraction inflates: 9.1 percent at 400 m, 5.9 at 600 m,
+    3.5 at 1000 m."""
+    from segmatch.match import comparison_length
+    cfg = MatchConfig()
+    for L, lo, hi in ((400.0, 0.08, 0.10), (600.0, 0.055, 0.065),
+                      (6000.0, 0.028, 0.031)):
+        n = comparison_length(L, cfg.res_m)
+        band_m = max(1, round(cfg.max_shift_frac * n)) * (L / n)
+        assert lo < band_m / L < hi, (L, band_m / L)
+
+
+def test_comparison_length_cap_is_documented_boundary():
+    """n_cmp caps at 512, so above about 17.9 km at res 70 the shape
+    comparison samples coarser than res_m/2 and silently under-resolves
+    the profile it was built from. Not reachable at the 6 km product
+    length; pinned so the boundary is not forgotten."""
+    from segmatch.match import comparison_length
+    cfg = MatchConfig()
+    limit = 512 * cfg.res_m / 2.0
+    assert comparison_length(limit, cfg.res_m) == 512
+    below = comparison_length(limit - 1000.0, cfg.res_m)
+    assert below < 512
+    assert (limit - 1000.0) / below == pytest.approx(cfg.res_m / 2.0, rel=0.02)
