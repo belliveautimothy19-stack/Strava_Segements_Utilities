@@ -344,3 +344,62 @@ class TestCliLibraryAgreement(unittest.TestCase):
                 float(parser_defaults[flag]), float(getattr(cfg, attr)),
                 places=9,
                 msg=f"{flag} default disagrees with MatchConfig.{attr}")
+
+
+class TestRealDataAuditTool(unittest.TestCase):
+    """The audit tool is itself a measuring instrument, and two of its
+    readings were wrong in ways that would have driven the resolution
+    choice in the wrong direction. These lock both."""
+
+    def test_spectrum_refuses_bands_below_nyquist(self):
+        """An earlier version interpolated every stream onto a fixed 5 m
+        grid regardless of its native sampling, so an FFT of a 40 m-spaced
+        stream happily reported energy at 50 m wavelength, all of it
+        manufactured by the interpolator. That biased the single
+        measurement the resolution choice turns on."""
+        from bench.real_data import grade_energy_by_scale
+        rng = np.random.default_rng(0)
+        x = np.arange(0, 6000.0, 1.0)
+        e = 1500 + 40 * np.sin(2 * np.pi * x / 800) + rng.normal(0, 0.3, x.size)
+        coarse_d = np.arange(0, 6000.0, 40.0)
+        coarse_e = np.interp(coarse_d, x, e)
+        r = grade_energy_by_scale(coarse_d, coarse_e)
+        self.assertIsNotNone(r)
+        fracs, sd, total, spacing, limit = r
+        self.assertGreater(limit, 40.0)
+        for band in fracs:
+            self.assertGreaterEqual(
+                band, limit,
+                f"reported a {band} m band from {spacing:.0f} m sampling")
+
+    def test_noise_probe_works_on_already_quantized_data(self):
+        """Most served streams are already rounded, so probing by
+        re-applying the same rounding is a no-op. The first version did
+        exactly that and reported a noise ratio of 0.00 at every
+        resolution, which would have licensed an arbitrarily fine
+        resolution on the noisiest possible data."""
+        from bench.real_data import resolution_noise_budget
+        rng = np.random.default_rng(1)
+        d = np.arange(0, 4000.0, 5.0)
+        e = np.round(1500 + 0.05 * d + 12 * np.sin(2 * np.pi * d / 400)
+                     + rng.normal(0, 0.4, d.size))
+        rows = resolution_noise_budget(d, e)
+        self.assertTrue(rows)
+        for res, sd, err, ratio in rows:
+            self.assertGreater(err, 0.0,
+                               f"no sensitivity measured at res_m {res}")
+
+    def test_noise_ratio_grows_as_resolution_sharpens(self):
+        """The physical invariant behind the whole resolution trade:
+        grade is a derivative, so a fixed elevation error contributes
+        more grade error the shorter the baseline it is taken over."""
+        from bench.real_data import resolution_noise_budget
+        rng = np.random.default_rng(2)
+        d = np.arange(0, 5000.0, 4.0)
+        e = 1500 + 0.04 * d + 20 * np.sin(2 * np.pi * d / 600) \
+            + rng.normal(0, 0.3, d.size)
+        rows = sorted(resolution_noise_budget(d, e), key=lambda r: -r[0])
+        ratios = [r[3] for r in rows]
+        self.assertGreater(ratios[-1], ratios[0] * 1.5,
+                           "finest resolution must carry a materially "
+                           "larger share of elevation-error noise")

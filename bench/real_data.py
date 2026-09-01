@@ -136,8 +136,18 @@ def load_gpx_dir(directory, limit=None):
 def grade_energy_by_scale(dist, elev, bands=(400.0, 200.0, 100.0, 50.0)):
     """Fraction of grade variance below each wavelength.
 
-    Resampled to a uniform grid first, because a real stream's spacing is
-    irregular and an FFT of irregularly sampled data is meaningless.
+    Only bands the stream can actually resolve are reported. This matters
+    more than it sounds: an earlier version of this function interpolated
+    every stream onto a fixed 5 m grid regardless of its native sampling,
+    which manufactures high-frequency content out of linear interpolation.
+    A stream sampled every 42 m carries no information below 84 m by
+    Nyquist, but interpolating it to 5 m and running an FFT happily
+    reports energy there, all of it artifact. That would have biased the
+    single measurement this whole audit turns on.
+
+    Returns (fractions, grade_sd, length, native_spacing, resolvable_limit)
+    where fractions omits any band below the resolvable limit, or None if
+    the stream is unusable.
     """
     d = np.asarray(dist, dtype=float)
     e = np.asarray(elev, dtype=float)
@@ -145,10 +155,20 @@ def grade_energy_by_scale(dist, elev, bands=(400.0, 200.0, 100.0, 50.0)):
     if good.sum() < 16:
         return None
     e = np.interp(d, d[good], e[good])
+    # Drop stalled samples before measuring spacing; a stationary recorder
+    # emits repeated distances that would understate the real interval.
+    step = np.diff(d)
+    moving = step[step > 1e-9]
+    if moving.size < 16:
+        return None
+    spacing = float(np.median(moving))
     total = float(d[-1] - d[0])
     if total < 400.0:
         return None
-    dx = 5.0
+    # Resolve no finer than 2.5 sample intervals; below that the FFT is
+    # reporting the interpolator, not the terrain.
+    limit = 2.5 * spacing
+    dx = max(spacing, 2.0)
     n = int(total / dx) + 1
     if n < 32:
         return None
@@ -161,27 +181,84 @@ def grade_energy_by_scale(dist, elev, bands=(400.0, 200.0, 100.0, 50.0)):
     tot = sp[1:].sum()
     if tot <= 0:
         return None
-    return {b: float(sp[1:][wl[1:] < b].sum() / tot) for b in bands}, \
-        float(np.std(g)), total
+    fr = {b: float(sp[1:][wl[1:] < b].sum() / tot)
+          for b in bands if b >= limit}
+    return fr, float(np.std(g)), total, spacing, limit
 
 
-def recommend_res_m(fracs_below_100):
-    """Turn measured short-scale energy into a resolution recommendation.
+def resolution_noise_budget(dist, elev, values=(150.0, 120.0, 90.0, 70.0,
+                                                  50.0, 35.0, 25.0)):
+    """Measure, per resolution, how much of the represented grade is real
+    terrain and how much is elevation-rounding artifact.
 
-    The rule is physical, not fitted: to distinguish a feature of pitch
-    length p the representation must resolve it, which needs res_m at or
-    below p. The counterweight is that finer res_m amplifies elevation
-    noise and quantization into grade. These thresholds bracket the
-    regimes measured on synthetic terrain, where grade energy below 100 m
-    was 5.9 percent at beta 1.7, 23.5 percent at 1.45 and 60.5 percent at
-    1.1.
+    This replaces an earlier recommendation that keyed off raw sub-100 m
+    grade energy, which is not a safe basis: rounding manufactures exactly
+    that energy. Measured on a real 2 km slice of Boulder trail recorded
+    at 0.1 m precision, quantizing it to 1 m took the apparent sub-100 m
+    share from 37 percent to 80 percent and nearly doubled apparent
+    roughness. A recommender reading that number would demand a finer
+    resolution the coarser the source data got, which is backwards.
+
+    So the quantity measured here is the ratio the choice actually turns
+    on: perturb the profile by the rounding the provider already applied,
+    and compare the resulting change in grade against the real grade
+    variation at that scale.
+
+    Returns a list of (res_m, terrain_sd, quant_err, ratio).
     """
-    f = float(np.median(fracs_below_100)) if len(fracs_below_100) else 0.0
-    if f < 0.10:
-        return 120.0, "smooth, long-wavelength terrain"
-    if f < 0.35:
-        return 70.0, "mixed terrain, the regime the defaults assume"
-    return 50.0, "rough terrain with substantial sub-100 m structure"
+    d = np.asarray(dist, dtype=float)
+    e = np.asarray(elev, dtype=float)
+    good = np.isfinite(e)
+    if good.sum() < 32:
+        return []
+    e = np.interp(d, d[good], e[good])
+    # Probe by PERTURBING at the rounding scale, not by re-rounding.
+    # Most served streams are already quantized, so re-applying the same
+    # rounding is a no-op and measures nothing: an earlier version of this
+    # reported a noise ratio of 0.00 at every resolution for exactly that
+    # reason. Adding a uniform error of the same magnitude measures the
+    # quantity that matters, namely how far the representation moves when
+    # elevation is wrong by about one rounding step.
+    #
+    # The probe is at least 1 m because that is what the provider was
+    # observed to deliver on most activities; a stream that happens to
+    # carry finer precision still has to survive being compared against
+    # ones that do not.
+    step = detect_quantization(e)
+    probe = max(step, 1.0)
+    rng = np.random.default_rng(0)
+    out = []
+    for res in values:
+        pn = build_profile(d, e, res, 8)
+        pq = build_profile(d, e + rng.uniform(-probe / 2, probe / 2, e.size),
+                           res, 8)
+        if pn is None or pq is None:
+            continue
+        m = min(len(pn.grade), len(pq.grade))
+        if m < 8:
+            continue
+        sd = float(np.std(pn.grade[:m]))
+        err = float(np.std(pn.grade[:m] - pq.grade[:m]))
+        out.append((res, sd, err, err / sd if sd > 0 else float("inf")))
+    return out
+
+
+def recommend_res_m(routes, max_noise_ratio=0.20):
+    """Finest resolution whose rounding-induced grade error stays under
+    max_noise_ratio of real grade variation, across the supplied routes.
+
+    Finer than that and the representation is increasingly describing the
+    provider's rounding rather than the hill.
+    """
+    per_res = {}
+    for _, d, e in routes:
+        for res, sd, err, ratio in resolution_noise_budget(d, e):
+            per_res.setdefault(res, []).append(ratio)
+    if not per_res:
+        return None, {}
+    med = {r: float(np.median(v)) for r, v in per_res.items()}
+    ok = [r for r in sorted(med) if med[r] <= max_noise_ratio]
+    return (min(ok) if ok else max(med)), med
 
 
 def run_audits(routes, cfg=None, verbose=True):
@@ -197,26 +274,51 @@ def run_audits(routes, cfg=None, verbose=True):
             print(*a)
 
     # ---- spectrum --------------------------------------------------------
-    fr100, sds, lens = [], [], []
-    for _, d, e in routes:
+    fr100, sds, lens, spac, skipped = [], [], [], [], 0
+    for name, d, e in routes:
         r = grade_energy_by_scale(d, e)
-        if r:
-            fracs, sd, total = r
+        if not r:
+            continue
+        fracs, sd, total, spacing, limit = r
+        sds.append(sd); lens.append(total); spac.append(spacing)
+        if 100.0 in fracs:
             fr100.append(fracs[100.0])
-            sds.append(sd)
-            lens.append(total)
-    if fr100:
-        rec, label = recommend_res_m(fr100)
-        res["spectrum"] = {"median_frac_below_100m": float(np.median(fr100)),
-                           "median_grade_sd": float(np.median(sds)),
-                           "median_length_m": float(np.median(lens)),
-                           "recommended_res_m": rec, "regime": label}
-        say(f"\nSPECTRUM  ({len(fr100)} routes)")
+        else:
+            skipped += 1
+    if sds:
+        say(f"\nSPECTRUM  ({len(sds)} routes)")
         say(f"  median grade sd            {np.median(sds):6.2f} %")
         say(f"  median route length        {np.median(lens):6.0f} m")
-        say(f"  grade energy below 100 m   {100*np.median(fr100):6.1f} %")
-        say(f"  -> {label}; recommended --grade-res-m {rec:.0f} "
-            f"(current default {cfg.res_m:.0f})")
+        say(f"  median sample spacing      {np.median(spac):6.1f} m")
+        if skipped:
+            say(f"  NOTE: {skipped} of {len(sds)} routes are sampled too "
+                f"coarsely to resolve 100 m and are excluded from the "
+                f"figure below rather than contributing interpolation "
+                f"artifact to it.")
+    if fr100:
+        res["spectrum"] = {"median_frac_below_100m": float(np.median(fr100)),
+                           "n_usable": len(fr100)}
+        say(f"  grade energy below 100 m   {100*np.median(fr100):6.1f} %  "
+            f"(from {len(fr100)} routes that can resolve it)")
+        say(f"  per route: " + ", ".join(f"{100*f:.0f}%" for f in fr100))
+        say("  NOTE: this figure is inflated by elevation rounding and must "
+            "not be used on its own to pick a resolution. See the noise "
+            "budget below, which is what the choice actually turns on.")
+    else:
+        say("  NO route is sampled finely enough to measure sub-100 m "
+            "energy.")
+
+    # ---- resolution noise budget ----------------------------------------
+    rec, med = recommend_res_m(routes)
+    if med:
+        res["noise_budget"] = {"per_res": med, "recommended_res_m": rec}
+        say(f"\nRESOLUTION NOISE BUDGET")
+        say("  rounding-induced grade error as a fraction of real grade "
+            "variation")
+        say("  " + "  ".join(f"{int(r)}m:{med[r]:.2f}" for r in sorted(med,
+                                                                reverse=True)))
+        say(f"  finest resolution under a 0.20 noise ratio: {rec:.0f} m "
+            f"(current default {cfg.res_m:.0f} m)")
 
     # ---- quantization ----------------------------------------------------
     steps = [detect_quantization(e) for _, _, e in routes]

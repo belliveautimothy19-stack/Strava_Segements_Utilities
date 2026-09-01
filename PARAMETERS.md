@@ -252,26 +252,138 @@ price of resolving terrain the old settings could not see. Pass
 
 ## Real-world validation
 
-**Status: not performed.** No credentials, no cached streams and no GPX
-files exist in this environment, and no real-data result is reported
-anywhere in this repository.
+**Status: performed.** Seven real routes from the athlete's own Strava
+account (Boulder and Roosevelt/White River National Forest, Colorado)
+were audited via `bench/real_data.py`. No route data is stored in this
+repository; it lives in the local cache outside the tree.
 
-`bench/real_data.py` runs label-free protocols against whatever the tool
-has already cached:
+### What real Strava streams actually look like
 
-    python3 -m bench.real_data --cache --res-sweep
+- **Elevation is quantized**, median step **1.00 m**. Precision varies
+  between activities in the same account: most carry whole metres, one
+  device generation carries 0.1 m. Any matcher must tolerate both.
+- Native sampling runs about 3.6 to 4 m on newer activities.
+- Distance streams contain long stalls, the same value repeated for
+  hundreds of samples where the athlete stopped.
+- Median grade standard deviation about 6 percent, though on the one
+  route available at 0.1 m precision the true figure is 3.0 percent and
+  the rest is rounding, see below.
 
-It measures the grade energy real terrain carries below 100 m and prints
-a recommended `--grade-res-m` from it, which is the single most valuable
-missing measurement, since the resolution above was selected against an
-assumed roughness rather than a measured one. It also reports elevation
-quantization, self-match consistency, robustness to decimation, jitter,
-rounding and reversal, a real cross-segment null distribution, and
-**sub-window recovery**: cutting a known interval out of a real segment
-and requiring the matcher to find it back, which is real ground truth
-obtained without any labelling.
+### The measurement that decided the question
 
-What it cannot establish is whether two *different* real segments that a
-runner would call the same kind of hill score close together. That needs
-human judgement and is the one thing no amount of self-consistency
-testing can substitute for.
+Real grade energy below 100 m wavelength **cannot be read off served
+streams directly**, because two artifacts inflate it and one suppresses
+it:
+
+Decimation suppresses it. The same real route measured at its native
+6 m sampling and then decimated by hand:
+
+| sampled every | energy below 100 m |
+|---------------|--------------------|
+| 6 m | 37% |
+| 10 m | 22% |
+| 15 m | 12% |
+| 25 m | 3% |
+| 40 m | 0% |
+
+Rounding inflates it. The same real 2 km slice, recorded at 0.1 m
+precision, then quantized by hand:
+
+| elevation step | grade sd | energy below 100 m |
+|----------------|----------|--------------------|
+| native 0.1 m | 3.03% | 37% |
+| 0.5 m | 3.58% | 55% |
+| **1.0 m (what Strava serves)** | **5.43%** | **80%** |
+| 2.0 m | 10.32% | 94% |
+
+So most of the short-scale content in a served stream is the provider's
+rounding, not the hill. Genuine sub-100 m terrain content on this
+athlete's routes is about **37 percent**, which is real and substantial,
+but less than half what the raw served data suggests.
+
+### Resolution noise budget on real data
+
+The quantity the choice actually turns on is how far the representation
+moves when elevation is wrong by about one rounding step, relative to
+real grade variation at that scale:
+
+| res_m | 150 | 120 | 90 | **70** | 50 | 35 | 25 |
+|-------|-----|-----|----|--------|----|----|----|
+| noise / signal | 0.03 | 0.05 | 0.07 | **0.09** | 0.13 | 0.17 | 0.22 |
+
+The finest resolution staying under a 0.20 ratio is 35 m. **70 m sits at
+0.09, comfortably inside the budget.**
+
+### Discrimination on real data
+
+Eleven cross-route window pairs were selected from real terrain to match
+within 6 percent on vertical and 0.9 percent-grade on composition: same
+length, same gain, same loss, same grade mix, different hills. Median
+scores:
+
+| res_m | self-match | matched-statistics pair | separation |
+|-------|-----------|-------------------------|------------|
+| 150 | 0.001 | 2.753 | 2.752 |
+| 120 | 0.000 | 3.041 | 3.041 |
+| 90 | 0.000 | 3.161 | 3.160 |
+| **70** | 0.000 | 2.829 | 2.829 |
+| 50 | 0.000 | 3.121 | 3.121 |
+
+Aggregate statistics do not establish a match on real data either. But
+note what this table does **not** show: separation is flat from 50 to
+150 m. **The real data does not prefer 70 m over 120 m.** The synthetic
+staircase probe that originally drove the change from 120 to 70 has no
+counterpart in these seven routes.
+
+### Self-consistency on real data
+
+| res_m | self-match | 1 m rounded | decimated 25 m | sub-window IoU | separation |
+|-------|-----------|-------------|----------------|----------------|------------|
+| 120 | 0.001 | 0.004 | 0.185 | 0.955 | 88.6x |
+| 90 | 0.001 | 0.002 | 0.213 | 0.932 | 92.8x |
+| **70** | 0.000 | 0.001 | 0.294 | 0.948 | 100.4x |
+| 50 | 0.000 | 0.000 | 0.436 | 0.980 | 106.5x |
+
+Reversed routes were identified as reversed in 7 of 7 cases. Sub-window
+recovery, which is real ground truth obtained by cutting a known interval
+out of a real route and requiring the matcher to find it back, localizes
+at IoU 0.93 to 0.98 at every resolution. Finer resolution is marginally
+better on separation and slightly worse on decimation robustness.
+
+### Verdict on the resolution
+
+**70 m is confirmed as safe on real data but is not shown to be
+necessary.** It sits well inside the measured noise budget, separates
+real matched-statistics negatives cleanly, and recovers real sub-windows.
+It is retained because the staircase failure mode it protects against is
+physically real even though it does not occur in these seven routes, and
+because the cost of retaining it is small. A reader who prefers the
+faster, quieter option can set `--grade-res-m 120` and lose nothing
+measurable on this athlete's terrain.
+
+What would change the answer: elevation rounded to 2 m or coarser, which
+pushes the noise ratio past the budget and argues for 120 m; or terrain
+with genuine short pitches, which argues for 50 m.
+
+### Two defects found in the audit tool itself
+
+Both would have driven the resolution choice the wrong way, and both now
+have regression tests.
+
+- `grade_energy_by_scale` interpolated every stream onto a fixed 5 m grid
+  regardless of native sampling, so it reported spectral energy at
+  wavelengths the data could not resolve, all of it interpolation
+  artifact. It now refuses bands below 2.5 sample intervals.
+- The resolution recommender probed quantization sensitivity by
+  re-rounding the elevation. Most served streams are already rounded, so
+  this was a no-op that reported a noise ratio of 0.00 at every
+  resolution, which would have licensed an arbitrarily fine resolution on
+  the noisiest possible data. It now perturbs at the rounding scale
+  instead.
+
+### What is still not established
+
+Whether two *different* real segments that a runner would call the same
+kind of hill score close together. That needs human labels. Everything
+above measures self-consistency, localization and separation, which is
+necessary but not sufficient.
