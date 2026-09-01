@@ -15,6 +15,7 @@ import bench.semantic as S
 from bench.length import (_subsample, auc, auc_ci, eer, operating_point,
                           recovery)
 from bench.synth import gain_matched_staircase, uniform_climb
+from tests.corpus_guard import requires_corpus
 from segmatch.match import MatchConfig, prepare_target, match_segment
 from segmatch.profile import vertical_change
 
@@ -153,6 +154,7 @@ def test_length_does_not_rescue_under_resolution():
     assert max(scores) < 1.0, scores
 
 
+@requires_corpus
 def test_shape_recovery_does_not_degrade_with_length():
     """The concern that prompted the audit was that a 6 km segment might
     be too long to match reliably. Self-recovery error is measured here

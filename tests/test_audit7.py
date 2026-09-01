@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 import audit7.corpus as C
+from tests.corpus_guard import requires_audit_corpus
 from audit7.independent import (auc_lower_is_better, bootstrap_ci,
                                 grade_percent, haversine_m,
                                 interval_is_adequate, overlap_fraction,
@@ -461,6 +462,7 @@ def test_cluster_bootstrap_accepts_tuple_trail_labels():
     assert not math.isnan(lo) and hi >= lo
 
 
+@requires_audit_corpus
 def test_trail_id_is_geographic_not_file_identity():
     """Two recordings of one trail must share a trail id.
 
@@ -480,6 +482,7 @@ def test_trail_id_is_geographic_not_file_identity():
         assert ids[a] != ids[b], (a, b)
 
 
+@requires_audit_corpus
 def test_pair_trail_id_collapses_self_and_cross_pairings():
     """A x A, B x B and A x B are one trail when A and B are recordings of
     the same ground, not three."""

@@ -8,8 +8,21 @@ different consequences.
 
   A  physical shape recovery   the same ground, re-measured or
                                re-sampled, must come back as the same
-                               shape. This is a property of the matcher
-                               alone and needs no corpus.
+                               shape. What is being measured is a
+                               property of the matcher alone, since each
+                               window is compared only against itself and
+                               no other route can affect the answer.
+
+                               It is NOT corpus-free. `recovery()` reads
+                               real cached GPS streams through
+                               `bench.semantic._routes_with_gps()`, so it
+                               needs the private real-data corpus and
+                               reports nothing without it. An earlier
+                               version of this text said "needs no
+                               corpus", which conflated "no OTHER route
+                               influences the score" with "no data
+                               required", and left a corpus-availability
+                               failure looking like a matcher defect.
 
   B  archetype similarity      a different piece of ground of the same
                                kind must score closer than unrelated
@@ -210,7 +223,10 @@ def length_report(win_m, res_m=70.0, stride_m=None, cap=None,
 
 
 # ---------------------------------------------------------------------
-# Experiment A: shape recovery, no corpus involved
+# Experiment A: shape recovery
+#
+# Self-comparison, so no other route influences any score, but it reads
+# the private real-data corpus and returns n=0 without it.
 # ---------------------------------------------------------------------
 
 def _cut(d, e, start, win_m):
@@ -223,6 +239,12 @@ def recovery(win_m, res_m=70.0, stride_m=None, seed=0):
 
     The target is a window of real terrain. The haystack is the route it
     came from. A perfect matcher returns the same stretch with score 0.
+
+    REQUIRES THE PRIVATE REAL-DATA CORPUS. Windows are cut from cached
+    Strava streams carrying GPS, read from
+    `~/.strava_segment_matcher_cache/streams`. With no corpus present this
+    returns `n = 0` and NaN medians rather than raising, so a caller that
+    does not check `n` will read an absent corpus as a result.
     """
     stride_m = stride_m if stride_m is not None else win_m
     rng = np.random.default_rng(seed)
