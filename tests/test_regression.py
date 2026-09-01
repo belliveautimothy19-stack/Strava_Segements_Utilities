@@ -403,3 +403,70 @@ class TestRealDataAuditTool(unittest.TestCase):
         self.assertGreater(ratios[-1], ratios[0] * 1.5,
                            "finest resolution must carry a materially "
                            "larger share of elevation-error noise")
+
+
+class TestSemanticExperimentIntegrity(unittest.TestCase):
+    """The semantic experiment is a measuring instrument and two of its
+    definitions were wrong in ways that would have manufactured a
+    favourable result. Both are locked here."""
+
+    def test_trivial_shifted_copies_are_excluded(self):
+        """Two windows cut from overlapping stretches of the SAME route
+        share most of their samples. Admitting them as 'same physical
+        terrain' positives measures only the matcher's ability to
+        recognise a slice of itself. Before this was excluded, category A
+        filled with pairs 250 m apart on one route sharing 750 m of
+        ground, and the positive baseline was correspondingly flattering.
+        """
+        from bench.semantic import categorize
+        rng = np.random.default_rng(0)
+        d = np.arange(0, 1000.0, 10.0)
+        ll = np.column_stack([40.0 + d * 1e-5, -105.0 + np.zeros_like(d)])
+        base = dict(route="R", d=d, e=1500 + 0.05 * d, ll=ll,
+                    label="up", arch="sustained_climb", steep=5.0,
+                    mean_grade=5.0, grades=np.full(20, 5.0),
+                    gain=50.0, loss=0.0)
+        a = dict(base, start=0.0)
+        b = dict(base, start=250.0)     # overlaps a by 750 m
+        c = dict(base, start=4000.0)    # disjoint along the route
+        pairs = categorize([a, b, c])
+        for p in pairs:
+            same_route = p["A"]["route"] == p["B"]["route"]
+            if same_route:
+                gap = abs(p["A"]["start"] - p["B"]["start"])
+                self.assertGreaterEqual(
+                    gap, float(p["A"]["d"][-1]),
+                    "an overlapping same-route pair was admitted")
+
+    def test_gentle_wobble_is_not_classified_rolling(self):
+        """A degree of wobble either side of a steady gentle climb is not
+        rolling terrain. Classifying on sign changes alone labelled it
+        that way, and 14 of 16 supposedly different-archetype pairs turned
+        out to be this artifact rather than a difference in kind."""
+        from bench.semantic import phase_signature, archetype_of
+        d = np.arange(0, 1200.0, 5.0)
+        gentle = 1500 + 0.04 * d + 0.8 * np.sin(2 * np.pi * d / 150.0)
+        label, feats = phase_signature(d, gentle)
+        self.assertEqual(archetype_of(label, feats["n_phases"]),
+                         "sustained_climb")
+        # a genuine roller, with real amplitude, must still classify as one
+        rolling = 1500 + 0.01 * d + 18.0 * np.sin(2 * np.pi * d / 300.0)
+        label2, feats2 = phase_signature(d, rolling)
+        self.assertEqual(archetype_of(label2, feats2["n_phases"]), "rolling")
+
+    def test_geo_relation_detects_a_retrace(self):
+        """Out-and-back running produces two passes over one piece of
+        ground. Those are the only genuine same-terrain positives
+        available without repeated activities, so the geometry test that
+        finds them has to work."""
+        from bench.semantic import geo_relation
+        lat = 40.0 + np.linspace(0, 0.01, 60)
+        out = np.column_stack([lat, np.full(60, -105.0)])
+        back = out[::-1].copy()
+        ov, sep = geo_relation(out, back)
+        self.assertGreater(ov, 0.9)
+        self.assertLess(sep, 5.0)
+        far = np.column_stack([lat + 0.05, np.full(60, -105.0)])
+        ov2, sep2 = geo_relation(out, far)
+        self.assertLess(ov2, 0.05)
+        self.assertGreater(sep2, 1000.0)

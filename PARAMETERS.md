@@ -387,3 +387,105 @@ Whether two *different* real segments that a runner would call the same
 kind of hill score close together. That needs human labels. Everything
 above measures self-consistency, localization and separation, which is
 necessary but not sufficient.
+
+
+## Semantic similarity: does the matcher find a different hill of the same kind?
+
+Every earlier experiment measured self-consistency (the same terrain
+re-measured) or separation (unrelated terrain rejected). Neither answers
+the question the tool is actually for. `bench/semantic.py` addresses it
+using four categories whose boundaries come from GPS geometry and from an
+ordered-shape classifier, both independent of the matcher and of each
+other. Aggregate statistics never define a positive; they define only
+category C, which is a negative.
+
+  A  same physical terrain, second pass (out-and-back retrace)
+  B  same archetype, geographically distinct hill
+  C  matched statistics, different archetype
+  D  clearly different
+
+87 windows of 1 km from 4 GPS-bearing routes; 3244 pairs after excluding
+trivial shifted copies; 660 scored at each of five resolutions.
+
+### The realistic baseline is not zero
+
+Category A, genuine second passes over the same ground, scores a median
+of **2.47**, not 0. Earlier audits quoted a self-match of 0.000, which
+compares identical bytes rather than the same hill measured twice. Every
+separation claim in this file should be read against 2.47, and the usable
+dynamic range is 2.47 to about 6.6, not 0 to 6.6.
+
+### Result, by archetype
+
+Position 0 is the same-hill baseline, 1 is arbitrary negatives:
+
+| archetype | n | 50 m | 70 m | 90 m | 120 m | 150 m |
+|-----------|---|------|------|------|-------|-------|
+| sustained_climb | 121 | 0.30 | 0.29 | 0.32 | 0.34 | 0.34 |
+| sustained_descent | 48 | 0.39 | 0.34 | 0.36 | 0.37 | 0.36 |
+| descent_then_climb | 16 | 0.54 | 0.46 | 0.40 | 0.38 | 0.32 |
+| rolling | 24 | 0.81 | 0.84 | 0.84 | 0.75 | 0.70 |
+| climb_then_descent | 11 | 0.99 | 0.93 | 0.76 | 0.76 | 0.66 |
+
+The split is sharp and it has a mechanism. A sustained climb is a
+near-constant grade sequence, so any two instances of similar steepness
+look alike whatever the alignment. Rolling terrain differs between hills
+in the PHASE of its oscillation, and a bounded warping band cannot bring
+two different phases into correspondence.
+
+Confirmed by widening the band at fixed resolution: rolling moves from
+0.67 to 0.42 as the band goes 0.03 to 0.30, while sustained barely moves.
+
+### Retrieval tells a more favourable story than pairwise medians
+
+Ranking every other window against a target, which is how the tool is
+used:
+
+| archetype | best same-archetype partner | same-archetype in top 10 |
+|-----------|---------------------------|--------------------------|
+| sustained_climb | top 0% | 4.9 |
+| descent_then_climb | top 0% | 4.6 |
+| rolling | top 0% | 3.2 |
+| sustained_descent | top 4% | 2.2 |
+| climb_then_descent | top 1% | 1.2 |
+
+For every archetype including rolling, the best same-archetype hill
+surfaces in the top few percent. A mediocre median does not matter if the
+top of the list is right, and the top of the list is what a user sees.
+
+### Length is the sharper limitation
+
+| window | 600 m | 1000 m | 1500 m | 2200 m |
+|--------|-------|--------|--------|--------|
+| B position | 0.06 | 0.22 | 0.36 | 0.73 |
+
+Archetype similarity is strong for short targets and nearly gone by
+2.2 km. Longer windows carry more idiosyncratic detail, so two different
+hills of the same kind diverge. Targets of several km, which is the
+documented use case, sit at the weak end of this trend, and no route in
+this corpus is long enough to measure past 2.2 km.
+
+### A correction to the second audit
+
+Audit 2 tightened `max_shift_frac` to 0.03 and the write-up implied it
+protected against the gain-matched staircase. It does not. The staircase
+scores 2.490, 4.777 and 6.806 for 40, 60 and 100 m pitches at **every**
+band from 0.03 to 0.30. That protection comes from resolution, not from
+the band. The band's real effect is the tradeoff above: wider recognises
+rolling archetypes better, and moves real matched-statistics negatives
+from 0.36 to 0.25 above the same-hill baseline.
+
+The band was left at 0.03. This is a product decision, not a defect, and
+it is recorded rather than taken silently.
+
+### Two defects found in the experiment itself
+
+- Category A initially admitted windows cut from overlapping stretches of
+  the same route, which share most of their samples. That is a slice of
+  itself, not a second pass, and it flattered the positive baseline.
+- The archetype classifier labelled gentle wobble around a steady climb
+  as "rolling" because it keyed on sign changes alone. 14 of 16
+  supposedly different-archetype pairs were that artifact. A phase now
+  has to average at least 2 percent grade to count as a phase.
+
+Both have regression tests.
